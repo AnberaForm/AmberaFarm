@@ -12,6 +12,7 @@ import json
 import math
 import random
 from array import array
+from collections import OrderedDict
 import traceback
 import zipfile
 import copy
@@ -98,6 +99,20 @@ class Fonts:
     def __init__(self):
         self.path = font_file()
         self.cache = {}
+        self.render_cache = OrderedDict()
+
+    def render(self, words, size, bold, color):
+        """Cache stable Japanese UI text, bounded to avoid unbounded VRAM use."""
+        key = (str(words), int(size), bool(bold), tuple(color))
+        cached = self.render_cache.get(key)
+        if cached is not None:
+            self.render_cache.move_to_end(key)
+            return cached
+        surface = self.get(size, bold).render(str(words), True, color)
+        self.render_cache[key] = surface
+        if len(self.render_cache) > 768:
+            self.render_cache.popitem(last=False)
+        return surface
 
     def get(self, size: int, bold: bool = False):
         key = (size, bold)
@@ -110,12 +125,12 @@ class Fonts:
 
 def text(surface, fonts, words, pos, size=18, color=INK, bold=False, centered=False, max_width=None):
     font = fonts.get(size, bold)
-    result = font.render(str(words), True, color)
+    result = fonts.render(str(words), size, bold, color)
     if max_width and result.get_width() > max_width:
         # フォントサイズだけ落とすことで極端に長い表記を収める。
         while size > 10 and result.get_width() > max_width:
             size -= 1
-            result = fonts.get(size, bold).render(str(words), True, color)
+            result = fonts.render(str(words), size, bold, color)
     rect = result.get_rect()
     if centered:
         rect.center = pos
@@ -266,6 +281,7 @@ TILE = 32
 WORLD_W, WORLD_H = 56, 36
 VIEW_TOP, VIEW_HEIGHT = 70, 576
 RESOLUTIONS = ((960, 540), (1280, 720), (1600, 900), (1920, 1080))
+FPS_CHOICES = (45, 60, 90, 120)
 FARM_X, FARM_Y = 8, 12
 SHOP_DOOR = INTERACTION_POINTS["shop"]
 FISH_PIER = INTERACTION_POINTS["fishing"]
@@ -288,7 +304,7 @@ def settings_file():
 
 
 def load_settings():
-    initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False}
+    initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False, 'fps_limit': 60}
     try:
         data = json.loads(settings_file().read_text(encoding='utf-8-sig'))
         if isinstance(data, dict):
@@ -300,6 +316,8 @@ def load_settings():
     initial['volume'] = max(0, min(100, initial['volume']))
     initial['brightness'] = max(50, min(130, initial['brightness']))
     initial['resolution'] = max(0, min(len(RESOLUTIONS)-1, initial['resolution']))
+    if initial['fps_limit'] not in FPS_CHOICES:
+        initial['fps_limit'] = 60
     return initial
 
 
@@ -384,6 +402,7 @@ class Game:
         self.set_resolution()
         self.stage = pygame.Surface((BASE_W, BASE_H)).convert()
         self.world_layer = pygame.Surface((BASE_W, VIEW_HEIGHT)).convert()
+        self.ground_layer = self.make_ground_layer()
         self.fonts = Fonts()
         self.assets = Assets()
         self.sound = SoundBank(self.settings)
@@ -449,6 +468,9 @@ class Game:
         self.friend_invites=[]
         self.room_pin = ''
         self.last_network_pos = 0
+        self.remote_targets = {}
+        self.display_fps = 0.0
+        self.show_performance = False
         self.join_fields = {'address':'127.0.0.1:47821','pin':'','name':self.state['player_name']}
         self.join_field = 'address'
         self.online_profile_received = False
@@ -719,12 +741,81 @@ class Game:
         self.online_profile_received = False
         self.online_guest = False
         self.remote_players = []
+        self.remote_targets = {}
         self.room_pin = ''
         self.chat_log = []
         self.chat_last_seq = 0
         self.chat_text = ''
         self.duel_state=None
         self.held_keys.clear()
+
+    def update_remote_positions(self, players, dt=0):
+        """Receive authoritative positions without making remote sprites jump."""
+        if not self.online_client or not isinstance(players, list):
+            return
+        known = {p['id']: p for p in self.remote_players if isinstance(p, dict) and 'id' in p}
+        targets = {}
+        for player in players:
+            if not isinstance(player, dict) or player.get('id') == self.online_client.id:
+                continue
+            pid = player.get('id')
+            try:
+                x, y = float(player['x']), float(player['y'])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not isinstance(pid, str) or not math.isfinite(x) or not math.isfinite(y):
+                continue
+            targets[pid] = (x, y)
+            if pid not in known:
+                known[pid] = dict(player)
+            else:
+                known[pid]['name'] = player.get('name', known[pid].get('name', 'Player'))
+                known[pid]['uid'] = player.get('uid', known[pid].get('uid', ''))
+        self.remote_targets = targets
+        self.remote_players = [known[pid] for pid in targets]
+
+    def interpolate_remote_positions(self, dt):
+        factor = 1 - math.exp(-min(.1, max(0, dt)) * 17)
+        for player in self.remote_players:
+            target = self.remote_targets.get(player['id'])
+            if target is None:
+                continue
+            dx, dy = target[0] - player['x'], target[1] - player['y']
+            if dx * dx + dy * dy > 160**2:
+                player['x'], player['y'] = target
+            else:
+                player['x'] += dx * factor
+                player['y'] += dy * factor
+
+    def sync_position(self, server_position):
+        if (not isinstance(server_position, list) or len(server_position) != 2
+                or not can_stand(*server_position)):
+            return
+        delta = [server_position[i] - self.player[i] for i in (0, 1)]
+        distance = math.hypot(*delta)
+        if 14 < distance < 650:
+            step = min(5.0, distance * .07)
+            candidate = [self.player[i] + delta[i] / distance * step for i in (0, 1)]
+            if can_stand(*candidate):
+                self.player = candidate
+        elif distance >= 650:
+            self.say('通信位置にズレがあります。F9で安全に位置を修正できます。', 5)
+
+    def receive_chat(self, messages, replace=False):
+        if not isinstance(messages, list):
+            return
+        if replace:
+            self.chat_log = messages[-30:]
+        else:
+            known = {m.get('seq') for m in self.chat_log if isinstance(m, dict)}
+            self.chat_log = (self.chat_log + [m for m in messages if isinstance(m, dict)
+                                                   and m.get('seq') not in known])[-30:]
+        if messages:
+            newest = messages[-1]
+            seq = newest.get('seq', 0)
+            if seq > self.chat_last_seq and self.chat_last_seq and self.modal != 'chat':
+                self.say(f'CHAT {newest.get("name", "Player")}: {newest.get("text", "")}', 7)
+            self.chat_last_seq = max(self.chat_last_seq, seq)
 
     def poll_network(self):
         if not self.online_client:
@@ -742,32 +833,16 @@ class Game:
                         self.story_nodes = packet['story_nodes']
                     self.duel_state=packet.get('duel')
                     self.friend_invites=packet.get('friend_invites',[])
-                    self.remote_players = [p for p in packet.get('players', [])
-                                           if p.get('id') != self.online_client.id]
-                    server_position = packet.get('self_pos')
-                    if (isinstance(server_position,list) and len(server_position)==2
-                            and can_stand(*server_position)):
-                        # Smooth correction (max 4px / snapshot) instead of
-                        # teleporting at the boundary of obstacles.
-                        delta=[server_position[i]-self.player[i] for i in (0,1)]
-                        distance=math.hypot(*delta)
-                        if 14<distance<650:
-                            step=min(4.0,distance*.035)
-                            candidate=[self.player[i]+delta[i]/distance*step for i in (0,1)]
-                            if can_stand(*candidate):self.player=candidate
-                        elif distance>=650:
-                            self.say('通信位置にズレがあります。F9で安全に位置を修正できます。',5)
-                    messages = packet.get('chat', [])
-                    if isinstance(messages, list):
-                        self.chat_log = messages[-30:]
-                        if messages:
-                            newest = messages[-1]
-                            seq = newest.get('seq', 0)
-                            if seq > self.chat_last_seq and self.chat_last_seq and self.modal != 'chat':
-                                self.say(f'CHAT {newest.get("name", "Player")}: {newest.get("text", "")}', 7)
-                            self.chat_last_seq = max(self.chat_last_seq, seq)
+                    self.update_remote_positions(packet.get('players', []))
+                    self.sync_position(packet.get('self_pos'))
+                    self.receive_chat(packet.get('chat', []), replace=True)
                 except (KeyError, TypeError, ValueError):
                     pass
+            elif packet.get('type') == 'positions':
+                self.update_remote_positions(packet.get('players', []))
+                self.sync_position(packet.get('self_pos'))
+            elif packet.get('type') == 'chat_delta':
+                self.receive_chat(packet.get('chat', []))
             elif packet.get('type') == 'result':
                 self.duel_state=packet.get('duel',self.duel_state)
                 self.friend_invites=packet.get('friend_invites',self.friend_invites)
@@ -788,7 +863,7 @@ class Game:
                 return
         if not self.online_client:
             return
-        if time.monotonic() - self.last_network_pos >= .10:
+        if time.monotonic() - self.last_network_pos >= 1.0 / 12.0:
             self.online_client.send('move', x=round(self.player[0], 2), y=round(self.player[1], 2))
             self.last_network_pos = time.monotonic()
         if self.online_guest and time.monotonic() - self.last_guest_save >= 12:
@@ -1221,6 +1296,10 @@ class Game:
         elif action=='brightness':
             self.settings['brightness']=max(50,min(130,self.settings['brightness']+val))
             if not store_settings(self.settings):self.say('設定を保存できません。')
+        elif action=='fps_limit':
+            current = FPS_CHOICES.index(self.settings['fps_limit'])
+            self.settings['fps_limit'] = FPS_CHOICES[(current+val) % len(FPS_CHOICES)]
+            if not store_settings(self.settings):self.say('設定を保存できません。')
         elif action=='resolution':
             self.settings['resolution']=(self.settings['resolution']+val)%len(RESOLUTIONS)
             self.set_resolution()
@@ -1323,7 +1402,9 @@ class Game:
                         v,cur,_=self.edit_text_event(event,self.join_fields[k],self.join_cursor[k],None,64)
                         self.join_fields[k]=v;self.join_cursor[k]=cur
                     continue
-                if event.key==pygame.K_F11:
+                if event.key==pygame.K_F3:
+                    self.show_performance=not self.show_performance
+                elif event.key==pygame.K_F11:
                     self.do_action('fullscreen',None)
                 elif event.key==pygame.K_F9 and self.scene=='world':self.rescue_player()
                 elif event.key==pygame.K_F5 and self.scene=='world':self.persist()
@@ -1413,34 +1494,38 @@ class Game:
         pygame.draw.rect(s,sign,(x+width//2-67,y+48,134,31),border_radius=2)
         text(s,self.fonts,name,(x+width//2,y+64),18,INK,True,True)
 
-    def draw_world(self):
-        w=self.world_layer
-        self.camera_update()
-        w.fill((86,147,76))
-        cx,cy=self.camera
-        startx=max(0,int(cx//TILE));endx=min(WORLD_W,int((cx+BASE_W)//TILE)+2)
-        starty=max(0,int(cy//TILE));endy=min(WORLD_H,int((cy+VIEW_HEIGHT)//TILE)+2)
-        for ty in range(starty,endy):
-            for tx in range(startx,endx):
-                x=int(tx*TILE-cx);y=int(ty*TILE-cy)
+    def make_ground_layer(self):
+        """Render terrain once. Moving the camera now uses a fast surface blit."""
+        ground = pygame.Surface((WORLD_W * TILE, WORLD_H * TILE)).convert()
+        ground.fill((86,147,76))
+        for ty in range(WORLD_H):
+            for tx in range(WORLD_W):
+                x=tx*TILE;y=ty*TILE
                 shade=(84,150,76) if (tx*13+ty*7)%7 else (93,160,82)
-                pygame.draw.rect(w,shade,(x,y,TILE,TILE))
+                pygame.draw.rect(ground,shade,(x,y,TILE,TILE))
                 if (tx*149+ty*101)%13==0:
-                    pygame.draw.rect(w,(113,172,78),(x+7,y+9,5,3))
-                    pygame.draw.rect(w,(53,109,48),(x+11,y+8,3,9))
+                    pygame.draw.rect(ground,(113,172,78),(x+7,y+9,5,3))
+                    pygame.draw.rect(ground,(53,109,48),(x+11,y+8,3,9))
                 if (tx*19+ty*11)%17==0:
-                    pygame.draw.rect(w,(166,189,95),(x+24,y+24,3,3))
+                    pygame.draw.rect(ground,(166,189,95),(x+24,y+24,3,3))
                 # Paths connecting home, fields, stores and mission board.
                 on_horizontal=(ty in (9,10,11,20,21) and 7<=tx<=42)
                 on_vertical=(tx in (22,23,24,35,36) and 10<=ty<=28)
                 on_entrance=(37<=tx<=43 and ty in (13,14,27,28))
                 if on_horizontal or on_vertical or on_entrance:
-                    pygame.draw.rect(w,(186,153,100),(x,y,TILE,TILE))
-                    if (tx*11+ty*5)%9==0:pygame.draw.rect(w,(165,132,85),(x+5,y+18,9,4))
+                    pygame.draw.rect(ground,(186,153,100),(x,y,TILE,TILE))
+                    if (tx*11+ty*5)%9==0:pygame.draw.rect(ground,(165,132,85),(x+5,y+18,9,4))
                 if 3<=tx<=13 and 26<=ty<=32:
-                    pygame.draw.rect(w,(71,128,164),(x,y,TILE,TILE))
+                    pygame.draw.rect(ground,(71,128,164),(x,y,TILE,TILE))
                     if (tx*7+ty*3)%4==0:
-                        pygame.draw.rect(w,(116,181,185),(x+10,y+14,12,2))
+                        pygame.draw.rect(ground,(116,181,185),(x+10,y+14,12,2))
+        return ground
+
+    def draw_world(self):
+        w=self.world_layer
+        self.camera_update()
+        cx,cy=self.camera
+        w.blit(self.ground_layer, (0, 0), pygame.Rect(int(cx), int(cy), BASE_W, VIEW_HEIGHT))
         # Lakeshore details and an east-bank boardwalk to the fishing location.
         for tx in range(12,16):
             x=int(tx*TILE-cx);y=int(29*TILE-cy)
@@ -1570,6 +1655,10 @@ class Game:
         day,h,m=clock_at(self.state)
         text(s,self.fonts,'アンベラ牧場',(23,12),27,CREAM,True)
         if self.online_client:text(s,self.fonts,f'ONLINE {len(self.remote_players)+1}/{8}  PIN {self.room_pin}',(22,53),13,GOLD_LIGHT,True)
+        if self.show_performance:
+            ping = self.online_client.latency_ms if self.online_client else None
+            metric = f'FPS {self.display_fps:.0f}' + (f'  PING {ping:.0f}ms' if ping is not None else '')
+            text(s,self.fonts,metric,(1080,52),14,GOLD_LIGHT,True,max_width=190)
         text(s,self.fonts,f'{day}日目  {h:02d}:{m:02d} {time_of_day(self.state)}',(316,15),20,WHITE,True)
         text(s,self.fonts,'♥'*self.state['stamina']+'♡'*(MAX_STAMINA-self.state['stamina']),(316,48),20,(247,127,132),True)
         text(s,self.fonts,f'所持金  {self.state["coins"]:,} G',(609,17),24,GOLD_LIGHT,True)
@@ -1668,20 +1757,21 @@ class Game:
         if self.message and time.monotonic()<self.message_until:text(s,self.fonts,self.message,(640,626),16,RED,True,True,max_width=900)
 
     def draw_settings(self):
-        self.overlay_panel('ゲーム設定','変更内容は即時反映・自動保存されます。明度はゲーム画面全体に適用。')
+        self.overlay_panel('ゲーム設定','変更は即時反映。FPS上限は目標値であり、PC性能により実FPSは変動します。F3で実測表示。')
         items=(('音量',f'{self.settings["volume"]} %','volume',10),
                ('明度',f'{self.settings["brightness"]} %','brightness',10),
-               ('解像度',f'{RESOLUTIONS[self.settings["resolution"]][0]} × {RESOLUTIONS[self.settings["resolution"]][1]}','resolution',1))
+               ('解像度',f'{RESOLUTIONS[self.settings["resolution"]][0]} × {RESOLUTIONS[self.settings["resolution"]][1]}','resolution',1),
+               ('描画FPS上限',f'{self.settings["fps_limit"]} FPS','fps_limit',1))
         for i,(label,value,action,step) in enumerate(items):
-            y=189+i*108
+            y=172+i*87
             text(self.stage,self.fonts,label,(248,y+12),29,INK,True)
             self.ui_button((646,y,65,52),'−',action,-step,size=29)
             box(self.stage,(730,y,210,52),CREAM,BROWN,5,2)
             text(self.stage,self.fonts,value,(835,y+26),22,INK,True,True)
             self.ui_button((955,y,65,52),'+',action,step,size=29)
         label='フルスクリーン ON' if self.settings['fullscreen'] else 'フルスクリーン OFF'
-        self.ui_button((429,522,422,58),label,'fullscreen',size=23)
-        self.ui_button((257,522,160,58),'名前の変更','name_edit',size=15)
+        self.ui_button((429,535,422,48),label,'fullscreen',size=21)
+        self.ui_button((257,535,160,48),'名前の変更','name_edit',size=15)
         if not self.sound.available:
             text(self.stage,self.fonts,'音声デバイスが使えないため、BGM/効果音は無音です。',(640,606),18,RED,False,True)
         self.ui_button((290,595,330,43),'最新版の配布ページ','open_release_page',RELEASES_URL,size=17)
@@ -2250,14 +2340,17 @@ class Game:
     def run(self):
         ticker=pygame.time.Clock()
         while self.running:
-            dt=ticker.tick(45)/1000
+            dt=min(.05, ticker.tick(self.settings['fps_limit'])/1000)
+            self.display_fps=ticker.get_fps()
             self.events()
             self.poll_notices()
             self.poll_mails()
             if self.scene=='world' and self.modal=='fishing':
                 self.update_fishing(dt)
             if self.scene=='world' and self.modal is None:self.move(dt)
-            if self.online_client:self.poll_network()
+            if self.online_client:
+                self.poll_network()
+                self.interpolate_remote_positions(dt)
             elif self.scene=='world' and time.monotonic()-self.last_save_time>=30:self.persist(True)
             if self.update_status and (not self.message or time.monotonic()>self.message_until):
                 self.say(self.update_status,9);self.update_status=''

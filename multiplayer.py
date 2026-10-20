@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LAN co-op protocol v2.
+"""LAN co-op protocol v4: low-bandwidth position streaming and async outgoing queue.
 
 Only plots are shared. Each connection has a separate inventory, money, stats,
 missions and story flags. Guests save their own profile on their own computer.
@@ -32,7 +32,10 @@ from v8_features import (field_action, buy_consumable, use_consumable, init_v8, 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 3
+PROTOCOL = 4
+POSITION_INTERVAL = 1.0 / 12.0
+STATE_INTERVAL = 1.5
+CHAT_INTERVAL = 0.08
 SPAWN = (336., 368.)
 
 
@@ -80,7 +83,8 @@ class RoomServer:
         self.sockets = {}
         self.host_id = None
         self.chat_log = []
-        self.chat_seq = 0.
+        self.chat_seq = 0
+        self.world_revision = 0
         self.friend_invites={}
         self.duels = {}  # temporary server-authoritative mini-game matches
         self.next_duel_id = 0
@@ -132,30 +136,69 @@ class RoomServer:
                             parent.host_id = pid
                         parent.sockets[pid] = sock
                     sock.sendall(pack({'type': 'welcome', 'id': pid, 'pin': parent.pin, 'spawn': [x, y]}))
+                    # Keep TCP packets small and disable Nagle's delay on position inputs.
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     sock.settimeout(None)
-                    last_sent = 0.
+                    last_state = -STATE_INTERVAL
+                    last_positions = -POSITION_INTERVAL
+                    last_chat = -CHAT_INTERVAL
+                    last_chat_seq = 0
+                    seen_world_revision = -1
+                    last_position_hash = None
+                    last_position_sent = 0.
                     while True:
-                        if time.monotonic() - last_sent >= .28:
-                            with parent.lock:
-                                player = parent.players.get(pid)
-                                if player is None:
-                                    break
+                        now = time.monotonic()
+                        packets = []
+                        with parent.lock:
+                            player = parent.players.get(pid)
+                            if player is None:
+                                break
+                            # Full state is sent initially, following farm edits and
+                            # periodically as a recovery / stamina synchronization.
+                            if (now - last_state >= STATE_INTERVAL
+                                    or seen_world_revision != parent.world_revision):
                                 restore_stamina(player['profile'])
-                                snap = {
+                                packets.append({
                                     'type': 'snapshot',
-                                    'state': merged_view(player['profile'], parent.state['plots'], parent.state['plot_preparation']),
+                                    'state': merged_view(player['profile'], parent.state['plots'],
+                                                         parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
-                                    'friend_invites': [{'id':x,'name':parent.players[x]['name']}
-                                                       for x in parent.friend_invites.get(pid,[]) if x in parent.players],
+                                    'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
+                                                       for x in parent.friend_invites.get(pid, []) if x in parent.players],
                                     'story_nodes': parent.story_nodes,
-                                    'players': [{k: p[k] for k in ('id', 'name', 'x', 'y','uid')}
-                                                for p in parent.players.values()],
+                                    'players': [{k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')}
+                                                for member in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
                                     'chat': list(parent.chat_log[-30:]),
-                                }
-                            sock.sendall(pack(snap))
-                            last_sent = time.monotonic()
-                        readable, _, _ = select.select([sock], [], [], .13)
+                                })
+                                last_state = now
+                                seen_world_revision = parent.world_revision
+                            # Position-only updates: roughly 12Hz; no deep copied profile.
+                            if now - last_positions >= POSITION_INTERVAL:
+                                positions = tuple((key, round(member['x'], 2), round(member['y'], 2))
+                                                  for key, member in parent.players.items())
+                                if positions != last_position_hash or now - last_position_sent >= 1.0:
+                                    packets.append({
+                                        'type': 'positions',
+                                        'players': [{k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')}
+                                                    for member in parent.players.values()],
+                                        'self_pos': [player['x'], player['y']],
+                                    })
+                                    last_position_hash = positions
+                                    last_position_sent = now
+                                last_positions = now
+                            # Chat is a separate, tiny and prompt message.
+                            if parent.chat_seq > last_chat_seq and now - last_chat >= CHAT_INTERVAL:
+                                messages = [m for m in parent.chat_log if m['seq'] > last_chat_seq]
+                                if messages:
+                                    packets.append({'type': 'chat_delta', 'chat': messages})
+                                    last_chat_seq = messages[-1]['seq']
+                                last_chat = now
+                        # Network writes MUST NOT hold parent.lock: a slow client
+                        # must not stall every other player on the host.
+                        for outgoing in packets:
+                            sock.sendall(pack(outgoing))
+                        readable, _, _ = select.select([sock], [], [], .025)
                         if not readable:
                             continue
                         raw = file.readline(MAX_PACKET + 1)
@@ -167,6 +210,7 @@ class RoomServer:
                                 continue
                         except (ValueError, UnicodeDecodeError):
                             continue
+                        response = None
                         with parent.lock:
                             if pid not in parent.players:
                                 break
@@ -175,14 +219,22 @@ class RoomServer:
                                 parent._move(pid, incoming)
                             elif kind == 'action':
                                 result = parent._action(pid, incoming)
+                                # Notify peers quickly (also for friend/duel changes).
+                                parent.world_revision += 1
                                 profile = parent.players[pid]['profile']
-                                sock.sendall(pack({'type': 'result', 'message': result,
+                                response = {'type': 'result', 'message': result,
                                     'state': merged_view(profile, parent.state['plots'], parent.state['plot_preparation']),
-                                    'duel':parent.duel_view(pid),
-                                    'friend_invites':[{'id':x,'name':parent.players[x]['name']}
-                                                      for x in parent.friend_invites.get(pid,[]) if x in parent.players]}))
+                                    'duel': parent.duel_view(pid),
+                                    'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
+                                                      for x in parent.friend_invites.get(pid, []) if x in parent.players]}
                             elif kind == 'chat':
                                 parent._chat(pid, incoming.get('message'))
+                            elif kind == 'ping':
+                                nonce = incoming.get('nonce')
+                                if isinstance(nonce, (int, float)) and math.isfinite(nonce):
+                                    response = {'type': 'pong', 'nonce': nonce}
+                        if response is not None:
+                            sock.sendall(pack(response))
                 except (OSError, ValueError, TypeError, OverflowError):
                     pass
                 finally:
@@ -497,12 +549,19 @@ class RoomClient:
             raise ConnectionError(welcome.get('message', 'Connection denied'))
         self.id = welcome['id']
         self.spawn = welcome.get('spawn', list(SPAWN))
-        self.inbox = queue.Queue(maxsize=12)
+        self.inbox = queue.Queue(maxsize=64)
         self.out_lock = threading.Lock()
         self.active = True
         self.sock.settimeout(None)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.send_queue = queue.Queue(maxsize=128)
+        self.latest_move = None
+        self.latency_ms = None
+        self.move_lock = threading.Lock()
         self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.writer = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
+        self.writer.start()
 
     def _reader_loop(self):
         try:
@@ -511,7 +570,15 @@ class RoomClient:
                 if not raw or len(raw) > MAX_PACKET:
                     break
                 msg = json.loads(raw.decode('utf-8'))
+                if msg.get('type') == 'pong':
+                    sent = msg.get('nonce')
+                    if isinstance(sent, (int, float)) and math.isfinite(sent):
+                        self.latency_ms = max(0, min(60000, (time.monotonic() - sent) * 1000))
+                    continue
                 if self.inbox.full():
+                    # A full queue indicates a stalled renderer. Drop the oldest
+                    # item to preserve connection / newest state; position packets
+                    # are coalesced on the game side via interpolation.
                     try:
                         self.inbox.get_nowait()
                     except queue.Empty:
@@ -524,15 +591,44 @@ class RoomClient:
             if not self.inbox.full():
                 self.inbox.put_nowait({'type': 'disconnected'})
 
+    def _writer_loop(self):
+        """Serialize writes away from Pygame's render/input thread.
+
+        Movement is coalesced: older coordinates are discarded rather than queued
+        behind chat or farm actions during network congestion.
+        """
+        try:
+            last_ping = 0.
+            while self.active:
+                try:
+                    packet = self.send_queue.get(timeout=.012)
+                except queue.Empty:
+                    packet = None
+                with self.move_lock:
+                    move = self.latest_move
+                    self.latest_move = None
+                if move is not None:
+                    self.sock.sendall(pack(move))
+                if packet is not None:
+                    self.sock.sendall(pack(packet))
+                if time.monotonic() - last_ping >= 2.0:
+                    last_ping = time.monotonic()
+                    self.sock.sendall(pack({'type': 'ping', 'nonce': last_ping}))
+        except OSError:
+            self.active = False
+
     def send(self, kind, **kwargs):
         if not self.active:
             return False
-        try:
-            with self.out_lock:
-                self.sock.sendall(pack({'type': kind, **kwargs}))
+        packet = {'type': kind, **kwargs}
+        if kind == 'move':
+            with self.move_lock:
+                self.latest_move = packet
             return True
-        except OSError:
-            self.active = False
+        try:
+            self.send_queue.put_nowait(packet)
+            return True
+        except queue.Full:
             return False
 
     def action(self, action, value):
