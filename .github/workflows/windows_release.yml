@@ -1,0 +1,76 @@
+name: Build Ambera Farm Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Get source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          architecture: 'x64'
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Check release version and tests
+        shell: pwsh
+        run: |
+          python -m compileall -q .
+          python -m pytest -q tests
+          if ('${{ github.ref_type }}' -eq 'tag') {
+            python verify_release_tag.py --tag '${{ github.ref_name }}'
+          }
+
+      - name: Build Windows standalone EXEs
+        shell: pwsh
+        run: python build_windows.py
+
+      - name: Smoke-test bundled game in headless SDL mode
+        shell: pwsh
+        run: |
+          $env:SDL_VIDEODRIVER = 'dummy'
+          $env:SDL_AUDIODRIVER = 'dummy'
+          & .\build_output\exe\AmberaGame.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pack initial distribution and automatic update payload
+        shell: pwsh
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $version = python -c "import json;print(json.load(open('version.json', encoding='utf-8'))['version'])"
+          python pack_windows_release.py --repo "$env:GITHUB_REPOSITORY" --version "$version"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Upload standalone archive (manual builds)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmberaFarm-Windows-TestBuild
+          path: build_output/release/AmberaFarm_Windows_v*.zip
+
+      - name: Publish EXE distribution and update manifest
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            build_output/release/AmberaFarm_Windows_v*.zip
+            build_output/release/AmberaFarm_payload_v*.zip
+            build_output/release/update_manifest.json
