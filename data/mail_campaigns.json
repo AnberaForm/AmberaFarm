@@ -1,4 +1,12 @@
 {
   "schema": 1,
-  "campaigns": []
+  "campaigns": [
+    {
+      "id": "v8_wwwww",
+      "title": "お詫び日ついて",
+      "coins": 250,
+      "item": "riceball",
+      "count": 3
+    }
+  ]
 }
