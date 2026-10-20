@@ -1,0 +1,8 @@
+build_output/
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+.ambera_venv/
+launcher_log.txt
+release/
