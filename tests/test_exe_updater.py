@@ -150,7 +150,7 @@ def test_pack_creates_installer_and_release(tmp_path):
     assert manifest_data['sha256'] == hashlib.sha256(update.read_bytes()).hexdigest()
     with zipfile.ZipFile(install) as bundle:
         assert set(bundle.namelist()) == {'AmberaFarm.exe','app/AmberaGame.exe',
-            'app/AmberaStoryEditor.exe','version.json','update_config.json','START_HERE.txt'}
+            'version.json','update_config.json','START_HERE.txt'}
         c = json.loads(bundle.read('update_config.json'))
         assert c['auto_update'] and 'ExampleUser/AmberaFarm' in c['manifest_url']
         assert all(name.isascii() for name in bundle.namelist())

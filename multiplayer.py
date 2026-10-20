@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import random
 import queue
 import secrets
 import select
@@ -24,11 +25,14 @@ from farm_core import (plant, harvest, buy_seeds, sell_crops, claim_mission,
 from fishing_core import FISH_BY_ID, add_catch, sell_fish
 from story_engine import finish_story
 from world_map import can_stand, plot_world, INTERACTION_POINTS
+from farm_mailbox import load as load_public_mail
+from v8_features import (field_action, buy_consumable, use_consumable, init_v8, restore_stamina,
+                         exchange_event, new_outfit, OUTFIT_COLORS, receive_public_mail)
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 2
+PROTOCOL = 3
 SPAWN = (336., 368.)
 
 
@@ -46,10 +50,12 @@ def safe_chat(message):
     return ''.join(c for c in message if c.isprintable() and c not in '\r\n\t')[:160].strip()
 
 
-def merged_view(profile, shared_plots):
+def merged_view(profile, shared_plots, shared_preparation=None):
     """Expose this player's private economy over the authoritative shared farm."""
     view = copy.deepcopy(profile)
     view['plots'] = copy.deepcopy(shared_plots)
+    if shared_preparation is not None:
+        view['plot_preparation']=copy.deepcopy(shared_preparation)
     return view
 
 
@@ -60,10 +66,13 @@ class _GameServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 class RoomServer:
-    def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None):
+    def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None, fresh=False):
         self.pin = str(pin if pin is not None else secrets.randbelow(900000) + 100000)
         self.host_token = secrets.token_hex(24)
         self.state = validate_state(copy.deepcopy(state))
+        if fresh:
+            self.state['plots']=[None] * PLOT_COUNT
+            init_v8(self.state)['plot_preparation']=[0]*PLOT_COUNT
         self.host_profile = copy.deepcopy(self.state)
         self.save_file = Path(save_file)
         self.lock = threading.RLock()
@@ -72,6 +81,9 @@ class RoomServer:
         self.host_id = None
         self.chat_log = []
         self.chat_seq = 0.
+        self.friend_invites={}
+        self.duels = {}  # temporary server-authoritative mini-game matches
+        self.next_duel_id = 0
         self.story_nodes = copy.deepcopy(story_nodes or [])
         parent = self
 
@@ -114,6 +126,7 @@ class RoomServer:
                             'id': pid, 'name': safe_name(hello.get('name')),
                             'x': x, 'y': y, 'last': time.monotonic(),
                             'profile': profile, 'last_chat': 0., 'last_rescue': 0.,
+                            'uid':profile['player_uid'],
                         }
                         if is_host:
                             parent.host_id = pid
@@ -127,11 +140,15 @@ class RoomServer:
                                 player = parent.players.get(pid)
                                 if player is None:
                                     break
+                                restore_stamina(player['profile'])
                                 snap = {
                                     'type': 'snapshot',
-                                    'state': merged_view(player['profile'], parent.state['plots']),
+                                    'state': merged_view(player['profile'], parent.state['plots'], parent.state['plot_preparation']),
+                                    'duel': parent.duel_view(pid),
+                                    'friend_invites': [{'id':x,'name':parent.players[x]['name']}
+                                                       for x in parent.friend_invites.get(pid,[]) if x in parent.players],
                                     'story_nodes': parent.story_nodes,
-                                    'players': [{k: p[k] for k in ('id', 'name', 'x', 'y')}
+                                    'players': [{k: p[k] for k in ('id', 'name', 'x', 'y','uid')}
                                                 for p in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
                                     'chat': list(parent.chat_log[-30:]),
@@ -160,7 +177,10 @@ class RoomServer:
                                 result = parent._action(pid, incoming)
                                 profile = parent.players[pid]['profile']
                                 sock.sendall(pack({'type': 'result', 'message': result,
-                                    'state': merged_view(profile, parent.state['plots'])}))
+                                    'state': merged_view(profile, parent.state['plots'], parent.state['plot_preparation']),
+                                    'duel':parent.duel_view(pid),
+                                    'friend_invites':[{'id':x,'name':parent.players[x]['name']}
+                                                      for x in parent.friend_invites.get(pid,[]) if x in parent.players]}))
                             elif kind == 'chat':
                                 parent._chat(pid, incoming.get('message'))
                 except (OSError, ValueError, TypeError, OverflowError):
@@ -168,6 +188,10 @@ class RoomServer:
                 finally:
                     if pid:
                         with parent.lock:
+                            parent._duel_disconnect(pid)
+                            parent.friend_invites.pop(pid,None)
+                            for invites in parent.friend_invites.values():
+                                if pid in invites:invites.remove(pid)
                             parent.players.pop(pid, None)
                             parent.sockets.pop(pid, None)
                             if pid == parent.host_id:
@@ -184,7 +208,7 @@ class RoomServer:
 
     def _save_host(self):
         # Host profile is the local save. Guest balances never enter this file.
-        self.state = merged_view(self.host_profile, self.state['plots'])
+        self.state = merged_view(self.host_profile, self.state['plots'], self.state['plot_preparation'])
         save_state(self.state, self.save_file)
 
     def _chat(self, pid, message):
@@ -218,14 +242,136 @@ class RoomServer:
             return
         p.update(x=x, y=y, last=now)
 
+    def duel_view(self,pid):
+        now=time.monotonic()
+        for ident,d in list(self.duels.items()):
+            if d['status']=='finished' and now-d['finished_at']>12:
+                del self.duels[ident]
+        for d in self.duels.values():
+            if pid not in (d['a'],d['b']):continue
+            opponent=d['b'] if pid==d['a'] else d['a']
+            other=self.players.get(opponent)
+            return {'id':d['id'],'status':d['status'],'challenger':d['a']==pid,
+                    'kind':d['kind'],'stake':d['stake'],
+                    'opponent':other['name'] if other else 'Player',
+                    'ready':now>=d.get('ready_at',now+1),
+                    'submitted':pid in d['moves'],
+                    'elapsed':round(now-d.get('started_at',now),3),
+                    'outcome':d.get('outcomes',{}).get(pid,'')}
+        return None
+
+    def _duel_disconnect(self,pid):
+        for ident,d in list(self.duels.items()):
+            if pid not in (d['a'],d['b']):continue
+            if d['status']=='active':
+                # Stake escrow refunds on incomplete matches or disconnections.
+                for player_id in (d['a'],d['b']):
+                    if player_id in self.players:self.players[player_id]['profile']['coins']+=d['stake']
+            del self.duels[ident]
+            try:self._save_host()
+            except (OSError,SaveError):pass
+
+    def _friend_action(self,pid,action,data):
+        me=self.players[pid]
+        other=self.players.get(data) if isinstance(data,str) else None
+        if not other or other is me:return '相手が見つかりません'
+        if action=='friend_request':
+            if other['uid'] in me['profile']['friend_ids']:return 'すでにフレンドです'
+            invites=self.friend_invites.setdefault(data,[])
+            if pid not in invites and len(invites)<12:invites.append(pid)
+            return 'フレンド申請を送りました'
+        if action=='friend_accept':
+            invites=self.friend_invites.get(pid,[])
+            if data not in invites:return '申請を確認できません'
+            invites.remove(data)
+            for owner,peer in ((me,other),(other,me)):
+                if peer['uid'] not in owner['profile']['friend_ids']:
+                    owner['profile']['friend_ids'].append(peer['uid'])
+                if peer['name'] not in owner['profile']['friends']:
+                    owner['profile']['friends'].append(peer['name'])
+            self._save_host()
+            return 'フレンドになりました！'
+        return '対応していない申請です'
+
+    def _duel_action(self,pid,action,data):
+        """Room-only competitive games; only virtual G. Two-party consent & escrow.
+
+        All scoring uses authoritative server time and server-generated targets.
+        """
+        me=self.players[pid]
+        nearby=lambda x:math.dist((x['x'],x['y']),INTERACTION_POINTS['hall'])<=100
+        mine=next((d for d in self.duels.values() if pid in (d['a'],d['b']) and d['status']!='finished'),None)
+        if action=='duel_challenge':
+            if mine or not isinstance(data,dict):return '対戦中、または招待データが不正です'
+            other=self.players.get(data.get('target'))
+            kind=data.get('kind');stake=data.get('stake')
+            if (not other or other is me or kind not in ('guess','timing','reaction') or
+                    type(stake) is not int or stake not in (0,10,50,100) or
+                    not nearby(me) or not nearby(other) or me['profile']['coins']<stake or
+                    any(other['id'] in (d['a'],d['b']) and d['status']!='finished' for d in self.duels.values())):
+                return '集会所に双方がいること、所持金・対戦相手を確認してください'
+            self.next_duel_id+=1
+            self.duels[self.next_duel_id]=dict(id=self.next_duel_id,a=pid,b=other['id'],
+                kind=kind,stake=stake,status='pending',created=time.monotonic(),moves={},outcomes={})
+            return '対戦を招待しました。相手の承諾を待っています。'
+        if not mine:return '有効な対戦がありません'
+        if action=='duel_reject' and mine['status']=='pending' and mine['b']==pid:
+            del self.duels[mine['id']]
+            return '対戦を断りました'
+        if action=='duel_accept' and mine['status']=='pending' and mine['b']==pid:
+            opponent=self.players.get(mine['a'])
+            if not opponent or not nearby(me) or not nearby(opponent) or any(
+                    self.players[x]['profile']['coins']<mine['stake'] for x in (mine['a'],mine['b'])):
+                del self.duels[mine['id']]
+                return '参加条件を満たしていません'
+            for player_id in (mine['a'],mine['b']):
+                self.players[player_id]['profile']['coins']-=mine['stake']
+            now=time.monotonic()
+            mine.update(status='active',started_at=now,ready_at=now+1.6,
+                        target=(random.randint(1,3) if mine['kind']=='guess' else (2.6 if mine['kind']=='timing' else 1.6)))
+            self._save_host()
+            return '対戦開始！ 相手と勝負してください'
+        if action=='duel_move' and mine['status']=='active':
+            now=time.monotonic()
+            if pid in mine['moves']:return 'すでに回答しました'
+            if mine['kind']=='guess':
+                if type(data) is not int or not 1<=data<=3:return '1〜3を選んでください'
+                score=abs(data-mine['target'])
+            elif mine['kind']=='timing':
+                # Server measured: aim for 2.6sec since start.
+                score=abs((now-mine['started_at'])-2.6)
+            else:
+                # Early press forfeits this reaction round.
+                score=(now-mine['ready_at']) if now>=mine['ready_at'] else 999
+            mine['moves'][pid]=round(score,5)
+            if len(mine['moves'])==2:
+                a,b=mine['a'],mine['b'];sa,sb=mine['moves'][a],mine['moves'][b]
+                if abs(sa-sb)<0.025:
+                    self.players[a]['profile']['coins']+=mine['stake']
+                    self.players[b]['profile']['coins']+=mine['stake']
+                    mine['outcomes']={a:'引き分け（掛け金返却）',b:'引き分け（掛け金返却）'}
+                else:
+                    winner=a if sa<sb else b;loser=b if winner==a else a
+                    self.players[winner]['profile']['coins']+=mine['stake']*2
+                    mine['outcomes']={winner:'勝利！掛け金を獲得',loser:'敗北。再挑戦しよう'}
+                mine['status']='finished';mine['finished_at']=now
+                self._save_host()
+            return '回答しました。結果を確認してください'
+        return 'この操作はまだできません'
+
     def _action(self, pid, msg):
         action = msg.get('action')
         data = msg.get('value')
         p = self.players[pid]
         profile = p['profile']
-        # Only the plot list belongs to everyone. Each player's other fields are private.
+        # Farm plots and soil preparation are shared; the economy remains private.
         profile['plots'] = self.state['plots']
+        profile['plot_preparation'] = self.state['plot_preparation']
         loc = lambda key, radius: math.dist((p['x'], p['y']), INTERACTION_POINTS[key]) <= radius
+        if action in ('friend_request','friend_accept'):
+            return self._friend_action(pid,action,data)
+        if isinstance(action,str) and action.startswith('duel_'):
+            return self._duel_action(pid,action,data)
         if action == 'rescue':
             now = time.monotonic()
             if now - p['last_rescue'] < 12:
@@ -245,6 +391,32 @@ class RoomServer:
                     ok = plant(profile, idx, crop)
                 else:
                     ok = harvest(profile, idx) is not None
+            elif action == 'field_v8' and isinstance(data, dict):
+                idx,crop=data.get('index'),data.get('crop')
+                if type(idx) is not int or not 0<=idx<PLOT_COUNT or crop not in CROP_BY_ID:
+                    return '畑の指定が不正です'
+                if math.dist((p['x'],p['y']),plot_world(idx))>54:
+                    return '畑から遠すぎます'
+                outcome=field_action(profile,idx,crop)
+                ok=outcome in ('till','water','plant','harvest')
+            elif action == 'event_trade':
+                ok=exchange_event(profile,data)
+            elif action == 'mail_claim':
+                gift=next((x for x in load_public_mail() if x['id']==data),None)
+                ok=bool(gift and receive_public_mail(profile,gift))
+            elif action == 'costume_color' and data in ('shirt','hat'):
+                draft=profile['outfit_draft']
+                draft[data]=(draft[data]+1)%len(OUTFIT_COLORS)
+                ok=True
+            elif action == 'costume_save':
+                ok=new_outfit(profile)
+            elif action == 'costume_equip' and type(data) is int:
+                ok=0<=data<len(profile['outfits'])
+                if ok:profile['outfit_index']=data
+            elif action == 'buy_item':
+                ok=buy_consumable(profile,data)
+            elif action == 'use_item':
+                ok=use_consumable(profile,data)
             elif action == 'buy' and loc('shop', 98):
                 crop, amount = data
                 ok = buy_seeds(profile, crop, amount)

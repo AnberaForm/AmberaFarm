@@ -130,7 +130,8 @@ def validate_state(raw):
         initial['stats']['harvested']=initial['harvest_total']
         for e in initial['history']:
             initial['harvested_types'][e['crop']]+=1
-        return initial
+        from v8_features import init_v8
+        return init_v8(initial)
     initial['coins']=_count(raw.get('coins',STARTING_COINS),'所持金')
     seeds=raw.get('seeds')
     if not isinstance(seeds,dict):raise SaveError('種のデータが不正です。')
@@ -161,6 +162,17 @@ def validate_state(raw):
             or len(flags)!=len(set(flags))):
         raise SaveError('ストーリーフラグが不正です。')
     initial['story_flags']=flags.copy()
+    # Preserve the v8 gameplay fields while migrating the original V2 saves.
+    from v8_features import validate_v8
+    for field in ('stamina','stamina_updated_at','plot_preparation','consumables','outfits','outfit_index',
+                  'outfit_draft','friends','player_uid','friend_ids','local_chat','player_name','mail_claimed',
+                  'event_tokens','event_claimed','event_earned_on','event_daily_count'):
+        if field in raw:
+            initial[field]=raw[field]
+    try:
+        validate_v8(initial)
+    except ValueError as exc:
+        raise SaveError(str(exc)) from exc
     return initial
 
 def load_json(file):

@@ -13,6 +13,7 @@ from story_engine import load_story
 from farm_core import state_path
 from story_admin_auth import validate_admin
 from notices_admin import NoticeAdminTab, DistributionTab
+from mail_admin import MailAdminTab
 
 BASE=Path(__file__).resolve().parent
 DEFAULT=BASE/'data'/'story_events.json'
@@ -63,8 +64,10 @@ class StoryEditor:
         main=ttk.Frame(notebook,padding=12);notebook.add(main,text='ストーリー管理')
         notice_panel=ttk.Frame(notebook,padding=12);notebook.add(notice_panel,text='お知らせ管理')
         distribution_panel=ttk.Frame(notebook,padding=12);notebook.add(distribution_panel,text='ゲーム配布・更新')
+        mail_panel=ttk.Frame(notebook,padding=12);notebook.add(mail_panel,text='アイテム配布')
         self.notice_admin=NoticeAdminTab(notice_panel)
         self.distribution_admin=DistributionTab(distribution_panel)
+        self.mail_admin=MailAdminTab(mail_panel)
         ttk.Label(main,text='ストーリー管理 — 追加 / 編集 / 並べ替え',font=('Meiryo',15,'bold')).pack(anchor='w',pady=(0,10))
         ttk.Label(main,text='保存先：%APPDATA%\\AmberaFarm\\story_events.json（ゲーム更新で上書きされません）').pack(anchor='w')
         body=ttk.Panedwindow(main,orient='horizontal');body.pack(fill='both',expand=True,pady=12)

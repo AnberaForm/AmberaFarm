@@ -28,6 +28,8 @@ BUILDINGS = (
     Building('shop','たね屋',37,7,7,6,40.5,13.65),
     Building('shipping','出荷所',37,22,7,5,40.5,27.7),
     Building('fish_market','魚市場',24,26,6,3,26.4,29.65),
+    Building('general_store','雑貨屋',28,2,7,5,31.5,7.65),
+    Building('hall','集会所',46,18,8,6,50.0,24.7),
 )
 BUILDING_BY_ID = {b.key:b for b in BUILDINGS}
 

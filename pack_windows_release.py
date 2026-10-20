@@ -29,6 +29,7 @@ def pack(exe_folder: Path, output: Path, repo: str, version: str):
     payload = output / payload_name
     with zipfile.ZipFile(payload, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=8) as z:
         z.writestr('app/AmberaGame.exe', exes['AmberaGame.exe'])
+        # Existing v0.7 launchers require this legacy file in updates.
         z.writestr('app/AmberaStoryEditor.exe', exes['AmberaStoryEditor.exe'])
         z.writestr('version.json', version_bytes)
     with payload.open('rb') as handle:
@@ -43,7 +44,6 @@ def pack(exe_folder: Path, output: Path, repo: str, version: str):
     with zipfile.ZipFile(install, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=8) as z:
         z.writestr('AmberaFarm.exe', exes['AmberaFarm.exe'])
         z.writestr('app/AmberaGame.exe', exes['AmberaGame.exe'])
-        z.writestr('app/AmberaStoryEditor.exe', exes['AmberaStoryEditor.exe'])
         z.writestr('version.json', version_bytes)
         z.writestr('update_config.json', json.dumps(config, indent=2) + '\n')
         z.writestr('START_HERE.txt', (
@@ -51,7 +51,7 @@ def pack(exe_folder: Path, output: Path, repo: str, version: str):
             '1. Extract the WHOLE ZIP into a writable folder (for example Desktop/AmberaFarm).\r\n'
             '2. Double click AmberaFarm.exe (NOT app/AmberaGame.exe).\r\n'
             '3. The launcher checks for updates on every start, then starts the game.\r\n'
-            '4. Story editor: app/AmberaStoryEditor.exe or the menu in the game.\r\n'
+            '4. Admin editor is separate; it is not distributed to players.\r\n'
             '5. Save data: %%APPDATA%%\\AmberaFarm\\save.json.\r\n'
             '6. Game works offline. Failed updates do not block offline play.\r\n'
             'Online co-op remains direct IP/LAN (no public matchmaking).\r\n'
