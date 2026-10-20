@@ -9,7 +9,7 @@ from farm_core import new_state, load_json, progress_for, harvest
 from multiplayer import RoomServer, RoomClient, merged_view, safe_chat
 from player_movement import move_character, safe_destination
 from story_admin_auth import validate_admin
-from world_map import can_stand, BUILDINGS
+from world_map import can_stand, BUILDINGS, INTERACTION_POINTS
 
 
 def wait_until(pred, timeout=3):
@@ -86,11 +86,37 @@ class FeatureV06Tests(unittest.TestCase):
                 self.assertNotEqual(host_view['warehouse'], guest_view['warehouse'])
                 # Guest purchasing cannot take cash from host.
                 with room.lock:
-                    room.players[b.id].update(x=40.5*32, y=13.65*32, last=time.monotonic())
-                b.action('buy', ['radish', 1])
-                self.assertTrue(wait_until(lambda: room.players[b.id]['profile']['coins'] == 884))
+                    room.players[b.id].update(x=INTERACTION_POINTS['shop'][0], y=INTERACTION_POINTS['shop'][1], last=time.monotonic())
+                # Actions travel through a separate outbound queue and TCP handler.
+                # Under load on Windows runners, 3 seconds may expire before the
+                # server processes an otherwise valid purchase. Wait for the
+                # *acknowledged purchase result* instead of polling private server
+                # state on an arbitrary short deadline. Also surface any rejected
+                # server actions so failures are diagnosable in Actions logs.
+                self.assertTrue(b.action('buy', ['radish', 1]))
+                purchase_results = []
+
+                def purchase_acknowledged():
+                    for message in b.poll():
+                        if message.get('type') == 'result':
+                            purchase_results.append(message)
+                    return any(message.get('state', {}).get('coins') == 884
+                               for message in purchase_results)
+
+                purchase_ok = wait_until(purchase_acknowledged, timeout=12)
                 with room.lock:
-                    self.assertEqual(room.players[a.id]['profile']['coins'], 200)
+                    guest_coins = room.players[b.id]['profile']['coins']
+                    host_coins = room.players[a.id]['profile']['coins']
+                    guest_position = (room.players[b.id]['x'], room.players[b.id]['y'])
+                self.assertTrue(
+                    purchase_ok,
+                    f'Guest purchase was not acknowledged: coins={guest_coins}, '
+                    f'position={guest_position}, results='
+                    f'{[(m.get("message"), m.get("state", {}).get("coins")) for m in purchase_results]}, '
+                    f'client_active={b.active}',
+                )
+                self.assertEqual(guest_coins, 884)
+                self.assertEqual(host_coins, 200)
                 self.assertEqual(load_json(room.save_file)['coins'], 200)
                 # Server chat gets broadcast in the same room only.
                 b.chat('こんにちは 牧場！')
