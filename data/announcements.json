@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "notices": [
+    {
+      "id": "welcome_board",
+      "title": "アンベラ牧場のお知らせ掲示板",
+      "body": "ゲーム内からお知らせやアップデート情報を確認できるようになりました。新しい情報は起動時に読み込まれます。ネットにつながらない場合も前回取得した情報を表示できます。",
+      "category": "news",
+      "pinned": true,
+      "published": true,
+      "published_at": "2026-10-20",
+      "url": "https://github.com/AnberaForm/AmberaFarm/releases"
+    }
+  ]
+}

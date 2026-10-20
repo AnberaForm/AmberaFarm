@@ -17,6 +17,9 @@ import zipfile
 import copy
 import subprocess
 import socket
+import threading
+from queue import Queue, Empty
+import webbrowser
 
 try:
     import pygame
@@ -38,6 +41,8 @@ from world_map import BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, b
 from multiplayer import RoomServer, RoomClient, PORT
 from player_movement import move_character, safe_destination
 from updater import current_version, get_config, fetch_manifest
+from notices import (load_offline, fetch_public, load_seen, mark_seen,
+                     public_view, unread_count, RELEASES_URL)
 
 BASE_W, BASE_H = 1280, 720
 ROOT = Path(__file__).resolve().parent
@@ -429,13 +434,85 @@ class Game:
         self.story_event = None
         self.story_line = 0
         self.mission_page = 0
+        self.notice_feed = load_offline()
+        self.notice_seen = load_seen()
+        self.notice_page = 0
+        self.notice_selection = ''
+        self.notice_line_offset = 0
+        self.notice_status = '前回取得したお知らせを表示中（ネット接続時に更新）'
+        self.notice_queue = Queue()
+        self.notice_busy = False
+        self.notice_last_check = 0
         try:
             self.story_nodes = load_story(self.story_source())
         except (OSError, ValueError, UnicodeError) as exc:
             self.story_nodes = []
             self.say(f'物語データを読み込めません: {exc}', 8)
+        self.refresh_notices()
         if not self.assets.images:
             self.say('元の画像を使用するには、ZIPをゲームフォルダへ置くか「画像ZIP」から指定してください。', 14)
+
+    def refresh_notices(self, force=False):
+        if self.notice_busy:
+            return
+        if not force and time.monotonic() - self.notice_last_check < 300:
+            return
+        self.notice_busy = True
+        self.notice_last_check = time.monotonic()
+        self.notice_status = 'お知らせを取得しています...'
+        def worker():
+            try:
+                self.notice_queue.put(('ok', fetch_public()))
+            except Exception as exc:
+                self.notice_queue.put(('error', str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll_notices(self):
+        try:
+            while True:
+                status, value = self.notice_queue.get_nowait()
+                self.notice_busy = False
+                if status == 'ok':
+                    self.notice_feed = value
+                    self.notice_status = '最新のお知らせを取得しました。'
+                else:
+                    self.notice_status = '通信できないため、前回のお知らせを表示しています。'
+        except Empty:
+            pass
+
+    def read_notice(self, ident):
+        if self.notice_selection != ident:
+            self.notice_line_offset = 0
+        self.notice_selection = ident
+        try:
+            self.notice_seen = mark_seen(ident, self.notice_seen)
+        except (OSError, ValueError):
+            self.say('既読情報を保存できませんでした。', 5)
+
+    def open_notices(self):
+        self.modal = 'notices'
+        items = public_view(self.notice_feed)
+        if items and self.notice_selection not in {n['id'] for n in items}:
+            self.notice_selection = items[0]['id']
+        if self.notice_selection:
+            self.read_notice(self.notice_selection)
+        self.refresh_notices()
+
+    def wrap_notice(self, message, max_px, size=18, max_lines=13):
+        font = self.fonts.get(size)
+        output = []
+        for raw_line in str(message).splitlines() or ['']:
+            line = ''
+            for ch in raw_line:
+                if font.size(line + ch)[0] > max_px and line:
+                    output.append(line)
+                    line = ch
+                else:
+                    line += ch
+            output.append(line)
+            if len(output) >= max_lines:
+                break
+        return output[:max_lines]
 
     def story_source(self):
         user_path = state_path().parent / 'story_events.json'
@@ -870,7 +947,17 @@ class Game:
         if self.online_client and action in ('buy','ship','fish_sell','claim'):
             self.online_client.action(action,list(val) if isinstance(val,tuple) else val)
             return
-        if action=='host_room':self.reload_story();self.start_room()
+        if action=='notices':self.open_notices()
+        elif action=='notices_refresh':self.refresh_notices(force=True)
+        elif action=='notice_pick':self.read_notice(val)
+        elif action=='notice_scroll':self.notice_line_offset = max(0, self.notice_line_offset + val)
+        elif action=='notice_page':
+            items = public_view(self.notice_feed)
+            self.notice_page = max(0, min(max(0,(len(items)-1)//5), self.notice_page + val))
+            first = self.notice_page*5
+            if first < len(items):self.read_notice(items[first]['id'])
+        elif action=='open_release_page':webbrowser.open(val or RELEASES_URL)
+        elif action=='host_room':self.reload_story();self.start_room()
         elif action=='join_dialog':self.modal='join'
         elif action=='join_field':self.join_field=val
         elif action=='join_room':self.join_room()
@@ -1313,8 +1400,10 @@ class Game:
         self.ui_button((649,391,210,50),'オンライン参加','join_dialog',size=18)
         self.ui_button((421,452,210,49),'設定','settings',size=22)
         self.ui_button((649,452,210,49),'遊び方','overlay','help',size=22)
-        self.ui_button((421,511,210,49),'ストーリー管理','story_editor',size=18)
-        self.ui_button((649,511,210,49),'終了','quit',size=22)
+        self.ui_button((314,511,206,49),'ストーリー管理','story_editor',size=17)
+        unseen = unread_count(self.notice_feed, self.notice_seen)
+        self.ui_button((537,511,206,49),f'お知らせ {"NEW "+str(unseen) if unseen else ""}','notices',size=17)
+        self.ui_button((760,511,206,49),'終了','quit',size=22)
         status='保存データを読み込み済み' if self.save_file.exists() else '初回開始：新しい牧場が用意されています'
         text(s,self.fonts,status,(640,586),18,GREEN_DARK,True,True)
         if self.load_warning and self.read_only:
@@ -1497,11 +1586,53 @@ class Game:
         text(self.stage,self.fonts,f'{self.story_line+1} / {len(node["lines"])}',(866,533),17,GREEN_DARK)
         self.ui_button((447,578,385,63),'つづきを読む  ▶','next_story',size=23)
 
+    def draw_notices(self):
+        self.overlay_panel('牧場のお知らせ / NEWS', '更新情報・イベント・運営からのお知らせを掲載します。')
+        notices = public_view(self.notice_feed)
+        total_pages = max(1, (len(notices) + 4)//5)
+        self.notice_page = max(0, min(total_pages-1, self.notice_page))
+        visible = notices[self.notice_page*5:(self.notice_page+1)*5]
+        for index, n in enumerate(visible):
+            x, y = 205, 166 + index*80
+            selected = n['id'] == self.notice_selection
+            fill = (213,234,183) if selected else CREAM
+            box(self.stage, (x,y,361,72), fill, GOLD if selected else BROWN, 6, 2)
+            unread = '● ' if n['id'] not in self.notice_seen else ''
+            kind = {'news':'お知らせ','update':'更新','event':'イベント','maintenance':'メンテ'}[n['category']]
+            text(self.stage,self.fonts, unread + kind + (' / 重要' if n['pinned'] else ''), (x+12,y+8),15,RED if unread else GREEN_DARK,True,max_width=335)
+            text(self.stage,self.fonts,n['title'], (x+12,y+35),17,INK,True,max_width=335)
+            self.register('notice_pick',(x,y,361,72),n['id'])
+        box(self.stage,(585,164,481,408),WHITE,BROWN,7,3)
+        current = next((n for n in notices if n['id']==self.notice_selection), None)
+        if current:
+            text(self.stage,self.fonts,current['title'],(603,181),23,BROWN,True,max_width=439)
+            text(self.stage,self.fonts,current['published_at'] or '公開日未設定',(604,222),15,GREEN_DARK)
+            pygame.draw.line(self.stage,BROWN,(603,249),(1046,249),2)
+            all_lines = self.wrap_notice(current['body'], 437, 18, 150)
+            max_offset = max(0, len(all_lines)-8)
+            self.notice_line_offset = min(self.notice_line_offset, max_offset)
+            for i,line in enumerate(all_lines[self.notice_line_offset:self.notice_line_offset+8]):
+                text(self.stage,self.fonts,line,(605,271+i*26),18,INK)
+            if max_offset:
+                text(self.stage,self.fonts,f'{self.notice_line_offset+1} / {max_offset+1}',(615,482),13,GREEN_DARK)
+            self.ui_button((603,520,64,43),'▲','notice_scroll',-3,disabled=self.notice_line_offset<=0,size=19)
+            self.ui_button((673,520,64,43),'▼','notice_scroll',3,disabled=self.notice_line_offset>=max_offset,size=19)
+            if current['url']:
+                self.ui_button((747,519,295,43),'公式配布ページを見る','open_release_page',current['url'],size=17)
+        else:
+            text(self.stage,self.fonts,'公開中のお知らせはまだありません。',(642,275),20,INK)
+        text(self.stage,self.fonts,f'{self.notice_page+1}/{total_pages} ページ', (393,598),17,GREEN_DARK,True,True)
+        self.ui_button((211,583,103,38),'前へ','notice_page',-1,disabled=self.notice_page==0,size=16)
+        self.ui_button((469,583,102,38),'次へ','notice_page',1,disabled=self.notice_page==total_pages-1,size=16)
+        self.ui_button((690,588,317,43),'最新情報を再読み込み','notices_refresh',size=18)
+        text(self.stage,self.fonts,self.notice_status,(635,646),15,GREEN_DARK,False,True,max_width=820)
+
     def draw_pause(self):
         self.overlay_panel('ポーズ  /  MENU','ゲームを閉じている間も畑の成長は進みます。')
+        unseen = unread_count(self.notice_feed, self.notice_seen)
         labels = [('ゲームに戻る','resume',None),('設定','settings',None),
                   ('種と倉庫','overlay','inventory'),('ミッション','overlay','missions'),
-                  ('セーブ管理・操作説明','overlay','help'),('緊急脱出 F9','rescue',None)]
+                  ('セーブ管理・操作説明','overlay','help'),('お知らせ'+(' NEW' if unseen else ''),'notices',None)]
         if self.online_client:
             labels.append(('チャットを開く T','chat',None))
         labels.append(('タイトルへ戻る','return_title',None))
@@ -1595,6 +1726,7 @@ class Game:
             self.buttons.clear()
             if self.modal=='join':self.draw_join()
             elif self.modal=='chat':self.draw_chat()
+            elif self.modal=='notices':self.draw_notices()
             elif self.modal=='settings':self.draw_settings()
             elif self.modal=='shop':self.draw_shop()
             elif self.modal=='shipping':self.draw_shipping()
@@ -1619,6 +1751,7 @@ class Game:
         while self.running:
             dt=ticker.tick(45)/1000
             self.events()
+            self.poll_notices()
             if self.scene=='world' and self.modal=='fishing':
                 self.update_fishing(dt)
             if self.scene=='world' and self.modal is None:self.move(dt)

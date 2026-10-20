@@ -12,6 +12,7 @@ from tkinter import ttk,messagebox
 from story_engine import load_story
 from farm_core import state_path
 from story_admin_auth import validate_admin
+from notices_admin import NoticeAdminTab, DistributionTab
 
 BASE=Path(__file__).resolve().parent
 DEFAULT=BASE/'data'/'story_events.json'
@@ -56,9 +57,14 @@ def save_events(events,path=USER):
 
 class StoryEditor:
     def __init__(self):
-        self.root=tk.Tk();self.root.title('アンベラ牧場｜ストーリー管理画面');self.root.geometry('1080x710');self.root.minsize(850,570)
+        self.root=tk.Tk();self.root.title('アンベラ牧場｜管理画面');self.root.geometry('1110x760');self.root.minsize(860,590)
         self.events=load_story(story_path())
-        main=ttk.Frame(self.root,padding=12);main.pack(fill='both',expand=True)
+        notebook=ttk.Notebook(self.root);notebook.pack(fill='both',expand=True,padx=8,pady=8)
+        main=ttk.Frame(notebook,padding=12);notebook.add(main,text='ストーリー管理')
+        notice_panel=ttk.Frame(notebook,padding=12);notebook.add(notice_panel,text='お知らせ管理')
+        distribution_panel=ttk.Frame(notebook,padding=12);notebook.add(distribution_panel,text='ゲーム配布・更新')
+        self.notice_admin=NoticeAdminTab(notice_panel)
+        self.distribution_admin=DistributionTab(distribution_panel)
         ttk.Label(main,text='ストーリー管理 — 追加 / 編集 / 並べ替え',font=('Meiryo',15,'bold')).pack(anchor='w',pady=(0,10))
         ttk.Label(main,text='保存先：%APPDATA%\\AmberaFarm\\story_events.json（ゲーム更新で上書きされません）').pack(anchor='w')
         body=ttk.Panedwindow(main,orient='horizontal');body.pack(fill='both',expand=True,pady=12)
