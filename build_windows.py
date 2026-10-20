@@ -25,7 +25,7 @@ def build(destination=None):
     def invoke(name, source, datas=()):
         args = common + ['--name', name]
         for source_file, target in datas:
-            args += ['--add-data', source_file + ':' + target]
+            args += ['--add-data', str((BASE / source_file).resolve()) + ':' + target]
         args.append(str(BASE / source))
         print('Building ' + name, flush=True)
         subprocess.run(args, cwd=BASE, check=True)
