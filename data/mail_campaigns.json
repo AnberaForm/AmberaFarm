@@ -1,12 +1,4 @@
 {
   "schema": 1,
-  "campaigns": [
-    {
-      "id": "welcome_v8",
-      "title": "v8.0実装記念プレゼント",
-      "coins": 60,
-      "item": "riceball",
-      "count": 2
-    }
-  ]
+  "campaigns": []
 }
