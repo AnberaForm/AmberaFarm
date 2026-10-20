@@ -28,11 +28,12 @@ from world_map import can_stand, plot_world, INTERACTION_POINTS
 from farm_mailbox import load as load_public_mail
 from v8_features import (field_action, buy_consumable, use_consumable, init_v8, restore_stamina,
                          exchange_event, new_outfit, OUTFIT_COLORS, receive_public_mail)
+from coop_orders import new_board, view as board_view, contribute as contribute_order
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 4
+PROTOCOL = 5
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -84,6 +85,7 @@ class RoomServer:
         self.host_id = None
         self.chat_log = []
         self.chat_seq = 0
+        self.coop_board = new_board()
         self.world_revision = 0
         self.friend_invites={}
         self.duels = {}  # temporary server-authoritative mini-game matches
@@ -163,6 +165,7 @@ class RoomServer:
                                     'state': merged_view(player['profile'], parent.state['plots'],
                                                          parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
+                                    'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                        for x in parent.friend_invites.get(pid, []) if x in parent.players],
                                     'story_nodes': parent.story_nodes,
@@ -225,6 +228,7 @@ class RoomServer:
                                 response = {'type': 'result', 'message': result,
                                     'state': merged_view(profile, parent.state['plots'], parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
+                                    'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                       for x in parent.friend_invites.get(pid, []) if x in parent.players]}
                             elif kind == 'chat':
@@ -420,6 +424,14 @@ class RoomServer:
         profile['plots'] = self.state['plots']
         profile['plot_preparation'] = self.state['plot_preparation']
         loc = lambda key, radius: math.dist((p['x'], p['y']), INTERACTION_POINTS[key]) <= radius
+        if action == 'coop_contribute':
+            if not isinstance(data, dict):return '納品内容を確認してください'
+            result = contribute_order(self.coop_board, data.get('id'), pid, profile,
+                                      self.players, data.get('count', 1))
+            if '共同納品 +' in result or '達成！' in result:
+                try:self._save_host()
+                except (OSError,SaveError):return '納品結果のセーブに失敗しました（ホストに連絡してください）'
+            return result
         if action in ('friend_request','friend_accept'):
             return self._friend_action(pid,action,data)
         if isinstance(action,str) and action.startswith('duel_'):
