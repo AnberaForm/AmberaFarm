@@ -7,14 +7,24 @@ HOME_SPAWN = (336.0, 368.0)
 
 
 def safe_destination(start=HOME_SPAWN):
+    """Keep the player's saved neighborhood during a map redesign.
+
+    If a former shop is now a wall, find the nearest walkable tile instead of
+    teleporting every returning farmer to the beginning of the game.
+    """
     if can_stand(*start):
         return list(start)
-    # This is a defensive fallback for future map edits.
-    for r in range(1, 50):
-        for dx, dy in ((r, 0), (-r, 0), (0, r), (0, -r)):
-            point = ((10 + dx + .5) * 32, (11 + dy + .5) * 32)
-            if can_stand(*point):
-                return list(point)
+    center_x=max(1,min(54,int(float(start[0])//32)))
+    center_y=max(1,min(34,int(float(start[1])//32)))
+    for radius in range(0, 56):
+        for dx in range(-radius,radius+1):
+            for dy in (-radius,radius):
+                target=((center_x+dx+.5)*32,(center_y+dy+.5)*32)
+                if can_stand(*target):return list(target)
+        for dy in range(-radius+1,radius):
+            for dx in (-radius,radius):
+                target=((center_x+dx+.5)*32,(center_y+dy+.5)*32)
+                if can_stand(*target):return list(target)
     raise RuntimeError('No safe spawn tile')
 
 

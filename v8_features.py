@@ -39,6 +39,10 @@ def init_v8(state):
     state.setdefault('event_claimed', [])
     state.setdefault('event_earned_on', '')
     state.setdefault('event_daily_count', 0)
+    from profile_progress import init_profile
+    from town_features import init_town
+    init_profile(state)
+    init_town(state)
     return state
 
 
@@ -83,6 +87,12 @@ def validate_v8(raw):
     for field in ('event_tokens','event_daily_count'):
         if type(s[field]) is not int or s[field]<0:raise ValueError(field + 'が不正です')
     if not isinstance(s['event_earned_on'],str) or len(s['event_earned_on'])>12:raise ValueError('イベント日付が不正です')
+    from profile_progress import validate_profile
+    from town_features import validate_town
+    try:
+        validate_profile(s)
+        validate_town(s)
+    except ValueError as exc: raise ValueError(str(exc)) from exc
     return s
 
 

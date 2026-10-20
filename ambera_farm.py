@@ -38,7 +38,9 @@ from farm_core import (
 )
 from fishing_core import FISH, FISH_BY_ID, FishingRound, roll_fish, add_catch, sell_fish
 from story_engine import load_story, available_story, finish_story
-from world_map import BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, blocked as map_blocked, can_stand, plot_world as map_plot_world
+from world_map import (BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, water_at,
+                       path_at, plaza_at, flower_at, district_at, TRAVEL_STOPS, nearest_travel_stop, blocked as map_blocked,
+                       can_stand, plot_world as map_plot_world)
 from multiplayer import RoomServer, RoomClient, PORT
 from player_movement import move_character, safe_destination
 from updater import current_version, get_config, fetch_manifest
@@ -46,7 +48,11 @@ from notices import (load_offline, fetch_public, load_seen, mark_seen,
                      public_view, unread_count, RELEASES_URL)
 from farm_mailbox import load as load_public_mail, fetch as fetch_public_mail
 from inventory_grid import slots as inventory_slots, hotbar as inventory_hotbar, hotbar_offset
+from town_features import (init_town, move_chest, rest_in_bed, STORAGE_IDS, STORAGE_NAMES)
 from coop_orders import new_board, view as coop_board_view
+from kabuball_core import KabuballMatch, LEFT, TOP, RIGHT, BOTTOM
+from profile_progress import (init_profile, refresh_progress, board_rows, claim_daily,
+                              public_profile, cache_public_profiles, unlocked_titles, TITLE_LABELS, clean_bio)
 from v8_features import (init_v8, field_action, field_phase, restore_stamina, MAX_STAMINA, ITEMS,
                          buy_consumable, use_consumable, OUTFIT_COLORS, new_outfit,
                          time_of_day, active_event, EVENT_GOODS, exchange_event,
@@ -397,7 +403,7 @@ class Game:
         pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=1024)
         pygame.init()
         pygame.font.init()
-        pygame.display.set_caption('アンベラ牧場 - v8.2 アップデート')
+        pygame.display.set_caption('アンベラ牧場 - v9.0 町と集会所の再開発')
         self.settings = load_settings()
         self.screen = None
         self.stage = pygame.Surface((BASE_W, BASE_H)).convert() if pygame.display.get_surface() else pygame.Surface((BASE_W, BASE_H))
@@ -407,6 +413,13 @@ class Game:
         self.ground_layer = self.make_ground_layer()
         self.fonts = Fonts()
         self.assets = Assets()
+        # Distinct exterior PNG sprites, pixel-scaled with no smoothing.
+        self.building_sprites={}
+        for b in BUILDINGS:
+            path=ROOT / 'assets' / 'buildings' / (b.key+'.png')
+            if path.is_file():
+                try:self.building_sprites[b.key]=pygame.image.load(str(path)).convert_alpha()
+                except pygame.error:pass
         self.sound = SoundBank(self.settings)
         self.save_file = state_path()
         self.read_only = False
@@ -420,6 +433,8 @@ class Game:
         init_v8(self.state)
         self.selected = self.state['selected_crop']
         self.inventory_page='seeds'
+        self.chest_category='seeds'
+        self.chest_page=0
         self.hotbar_start=0
         self.inventory_hover=None
         self.notice_zoom=False
@@ -430,6 +445,15 @@ class Game:
         self.clothing_preview=False
         self.large_map=False
         self.friend_input=''
+        self.arena_state=None
+        self.arena_leaders=[]
+        self.practice_match=None
+        self.last_arena_input=0.
+        self.profile_view_uid=None
+        self.bio_draft=''
+        self.bio_cursor=0
+        self.goal_celebration=0
+        self.arena_last_score_key=None
         self.name_draft=self.state['player_name']
         self.name_cursor=len(self.name_draft)
         self.name_anchor=None
@@ -463,7 +487,7 @@ class Game:
         self.facing = 'down'
         self.player = list(self.state['player'])
         if not can_stand(*self.player):
-            self.player=safe_destination()
+            self.player=safe_destination(self.player)
             self.state['player'] = list(self.player)
         self.camera = [0., 0.]
         self.scroll = 0
@@ -705,6 +729,7 @@ class Game:
             return False
         if self.read_only:
             return False
+        refresh_progress(self.state)
         profile = copy.deepcopy(self.state)
         profile['plots'] = copy.deepcopy(self.offline_state['plots'])
         profile['created_at'] = self.offline_state['created_at']
@@ -757,6 +782,9 @@ class Game:
         self.chat_last_seq = 0
         self.chat_text = ''
         self.duel_state=None
+        self.arena_state=None
+        self.arena_leaders=[]
+        self.practice_match=None
         self.coop_board=coop_board_view(new_board())
         self.held_keys.clear()
 
@@ -764,6 +792,7 @@ class Game:
         """Receive authoritative positions without making remote sprites jump."""
         if not self.online_client or not isinstance(players, list):
             return
+        cache_public_profiles(self.state,players)
         known = {p['id']: p for p in self.remote_players if isinstance(p, dict) and 'id' in p}
         targets = {}
         for player in players:
@@ -782,6 +811,8 @@ class Game:
             else:
                 known[pid]['name'] = player.get('name', known[pid].get('name', 'Player'))
                 known[pid]['uid'] = player.get('uid', known[pid].get('uid', ''))
+                if isinstance(player.get('public_profile'),dict):
+                    known[pid]['public_profile']=player['public_profile']
         self.remote_targets = targets
         self.remote_players = [known[pid] for pid in targets]
 
@@ -843,6 +874,10 @@ class Game:
                     if isinstance(packet.get('story_nodes'), list):
                         self.story_nodes = packet['story_nodes']
                     self.duel_state=packet.get('duel')
+                    self.arena_state=packet.get('arena')
+                    self.arena_leaders=packet.get('leaderboard',[])
+                    if self.arena_state and self.arena_state.get('status')=='active' and self.modal in ('arena','arena_match'):
+                        self.modal='arena_match'
                     self.coop_board=packet.get('coop_board',self.coop_board)
                     self.friend_invites=packet.get('friend_invites',[])
                     self.update_remote_positions(packet.get('players', []))
@@ -852,11 +887,23 @@ class Game:
                     pass
             elif packet.get('type') == 'positions':
                 self.update_remote_positions(packet.get('players', []))
+                self.arena_state=packet.get('arena',self.arena_state)
+                if self.arena_state and self.arena_state.get('status')=='active' and self.modal in ('arena','arena_match'):
+                    self.modal='arena_match'
                 self.sync_position(packet.get('self_pos'))
             elif packet.get('type') == 'chat_delta':
                 self.receive_chat(packet.get('chat', []))
             elif packet.get('type') == 'result':
+                warp=packet.get('warp_to')
+                if (isinstance(warp,list) and len(warp)==2
+                        and all(isinstance(x,(int,float)) and math.isfinite(x) for x in warp)
+                        and can_stand(*warp)):
+                    self.player=list(warp)
                 self.duel_state=packet.get('duel',self.duel_state)
+                self.arena_state=packet.get('arena',self.arena_state)
+                self.arena_leaders=packet.get('leaderboard',self.arena_leaders)
+                if self.arena_state and self.arena_state.get('status')=='active' and self.modal in ('arena','arena_match'):
+                    self.modal='arena_match'
                 self.coop_board=packet.get('coop_board',self.coop_board)
                 self.friend_invites=packet.get('friend_invites',self.friend_invites)
                 if isinstance(packet.get('state'), dict):
@@ -962,6 +1009,7 @@ class Game:
         if self.read_only:
             if not quiet:self.say('セーブが破損しているため保存停止中。セーブ読み込みをしてください。',9)
             return False
+        refresh_progress(self.state)
         self.state['selected_crop'] = self.selected
         self.state['player'] = [round(v,2) for v in self.player]
         try:
@@ -1051,13 +1099,18 @@ class Game:
         # Choose nearest action, not last in arbitrary ordering.
         options=[]
         for action,point,radius in (
-            ('shop', SHOP_DOOR, 98),('shipping',SHIP_DOOR,98),
-            ('missions',BOARD_POS,70),('home',HOME_POS,88),
-            ('fishing',FISH_PIER,65),('fish_market',FISH_MARKET,98),
-            ('general_store',INTERACTION_POINTS['general_store'],88),('hall',INTERACTION_POINTS['hall'],88),
+            ('shop', SHOP_DOOR, 78),('shipping',SHIP_DOOR,78),
+            ('missions',BOARD_POS,70),('home',HOME_POS,78),
+            ('fishing',FISH_PIER,65),('fish_market',FISH_MARKET,78),
+            ('general_store',INTERACTION_POINTS['general_store'],78),('hall',INTERACTION_POINTS['hall'],78),
+            ('workshop',INTERACTION_POINTS['workshop'],78),('cafe',INTERACTION_POINTS['cafe'],78),
+            ('greenhouse',INTERACTION_POINTS['greenhouse'],78),
             ('fisherman',FISHERMAN,62),('guide',GUIDE_POS,58),('merchant',MERCHANT_POS,58)):
             distance=math.dist(self.player,point)
             if distance<=radius:options.append((distance,action,None))
+        stop=nearest_travel_stop(*self.player,55)
+        if stop is not None:
+            options.append((math.dist(self.player,TRAVEL_STOPS[stop][1]),'travel',stop))
         idx=self.closest_plot()
         if idx is not None:
             options.append((math.dist(self.player,plot_world(idx)),'plot',idx))
@@ -1078,7 +1131,10 @@ class Game:
         elif action=='missions':self.modal='missions';self.mission_page=0
         elif action=='general_store':self.interior='general_store';self.modal='interior'
         elif action=='hall':self.interior='hall';self.modal='interior'
+        elif action in ('workshop','cafe','greenhouse'):
+            self.interior=action;self.modal='interior'
         elif action=='fishing':self.start_fishing()
+        elif action=='travel':self.modal='travel'
         elif action=='fisherman':self.start_story('nagi')
         elif action=='guide':self.start_story('guide')
         elif action=='merchant':self.start_story('merchant')
@@ -1136,7 +1192,94 @@ class Game:
         if self.online_client and action in ('buy','ship','fish_sell','claim'):
             self.online_client.action(action,list(val) if isinstance(val,tuple) else val)
             return
-        if action=='field':self.field_interaction(int(val))
+        if action=='profile':self.profile_view_uid=None;self.modal='profile'
+        elif action=='friend_profile':self.profile_view_uid=val;self.modal='profile'
+        elif action=='profile_edit':
+            self.bio_draft=self.state.get('profile_bio','')
+            self.bio_cursor=len(self.bio_draft)
+            self.modal='profile_edit'
+            pygame.key.start_text_input();pygame.key.set_repeat(350,36)
+        elif action=='profile_save':
+            bio=clean_bio(self.bio_draft)
+            if self.online_client:self.online_client.action('profile_bio',bio)
+            else:self.state['profile_bio']=bio;self.persist(True)
+            pygame.key.stop_text_input();pygame.key.set_repeat()
+            self.modal='profile';self.say('自己紹介を保存しました')
+        elif action=='profile_title':
+            if val in unlocked_titles(self.state):
+                if self.online_client:self.online_client.action('profile_title',val)
+                else:self.state['profile_title']=val;self.persist(True)
+        elif action=='daily_board':
+            refresh_progress(self.state)
+            self.modal='daily_board'
+        elif action=='daily_claim':
+            if self.online_client:self.online_client.action('daily_claim',val)
+            elif claim_daily(self.state,val):
+                self.persist(True);self.say('村の依頼達成！報酬を受け取りました')
+            else:self.say('まだ達成していないか、受取済みです')
+        elif action=='arena':self.modal='arena'
+        elif action=='arena_challenge':
+            if self.online_client:self.online_client.action('arena_challenge',{'target':val,'stake':0})
+        elif action in ('arena_accept','arena_reject','arena_cancel'):
+            if self.online_client:self.online_client.action(action,None)
+        elif action=='arena_practice':
+            self.practice_match=KabuballMatch(999999,'local','cpu')
+            self.practice_match.accept()
+            self.modal='arena_match'
+        elif action=='arena_leave':
+            self.practice_match=None
+            self.modal='arena'
+        elif action=='arena_online_replay':
+            if self.online_client:self.online_client.action('arena_replay',None)
+        elif action=='arena_replay':
+            self.practice_match=KabuballMatch(999999,'local','cpu')
+            self.practice_match.accept();self.modal='arena_match'
+        elif action=='goal_effect':
+            allowed=(val==0 or val==1 and self.state['arena_record']['wins']>=1 or
+                     val==2 and self.state['arena_record']['wins']>=5)
+            if allowed:
+                if self.online_client:self.online_client.action('goal_effect',val)
+                else:self.state['goal_effect']=val;self.persist(True)
+            else:self.say('ゴール演出は1勝・5勝すると順に解放されます')
+        elif action=='field':self.field_interaction(int(val))
+        elif action=='chest':
+            self.chest_category='seeds';self.chest_page=0;self.modal='chest'
+        elif action=='chest_category':
+            if val in STORAGE_IDS:self.chest_category=val;self.chest_page=0
+        elif action=='chest_page':
+            count=len(STORAGE_IDS[self.chest_category])
+            self.chest_page=max(0,min((count-1)//6,self.chest_page+int(val)))
+        elif action=='chest_move':
+            category,ident,amount,withdraw=val
+            source=(self.state['home_chest'][category] if withdraw else self.state[category])
+            count=min(source[ident],9999) if amount==-1 else amount
+            if not count:return
+            if self.online_client:
+                self.online_client.action('home_chest',{'category':category,'item':ident,
+                                                        'count':count,'withdraw':withdraw})
+            elif move_chest(self.state,category,ident,count,withdraw):
+                self.persist(True);self.say('自宅の収納を更新しました')
+            else:self.say('持ち物が足りないか、収納がいっぱいです')
+        elif action=='travel_to':
+            if val not in TRAVEL_STOPS:return
+            if nearest_travel_stop(*self.player,75) is None:
+                self.say('馬車の停留所まで歩いてください');return
+            if self.online_client:
+                self.online_client.action('travel',val)
+                self.modal=None
+            else:
+                tx,ty=TRAVEL_STOPS[val][1]
+                if can_stand(tx,ty):
+                    self.player=[tx,ty]
+                    self.state['player']=list(self.player)
+                    self.modal=None;self.persist(True)
+                    self.say('馬車で '+TRAVEL_STOPS[val][0]+' へ移動しました！')
+            return
+        elif action=='home_rest':
+            if self.online_client:self.online_client.action('home_rest',None)
+            elif rest_in_bed(self.state):
+                self.persist(True);self.say('ベッドで休憩。体力が満タンになりました！')
+            else:self.say('体力はすでに満タンです')
         elif action=='inventory_page':self.inventory_page=val
         elif action=='hotbar_offset':self.hotbar_start=hotbar_offset(self.hotbar_start,val)
         elif action=='inventory_pick':
@@ -1288,7 +1431,7 @@ class Game:
         elif action=='close':
             if self.modal=='chat':self.close_chat()
             else:
-                if self.modal in ('join','name_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
+                if self.modal in ('join','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
                 self.modal=None
         elif action=='fish_again':self.start_fishing()
         elif action=='fish_sell':
@@ -1415,6 +1558,9 @@ class Game:
                 self.chat_composition=''
                 self.chat_text,self.chat_cursor,self.chat_anchor=self.edit_text_event(
                     event,self.chat_text,self.chat_cursor,self.chat_anchor)
+            elif event.type==pygame.TEXTINPUT and self.modal=='profile_edit':
+                self.bio_draft,self.bio_cursor,_=self.edit_text_event(
+                    event,self.bio_draft,self.bio_cursor,None,90)
             elif event.type==pygame.TEXTINPUT and self.modal=='name_edit':
                 self.name_draft,self.name_cursor,self.name_anchor=self.edit_text_event(
                     event,self.name_draft,self.name_cursor,self.name_anchor,18)
@@ -1428,8 +1574,18 @@ class Game:
                     self.ime_composing=False
                     self.held_keys.clear()
                 if event.key in (pygame.K_w,pygame.K_a,pygame.K_s,pygame.K_d,
-                                 pygame.K_UP,pygame.K_DOWN,pygame.K_LEFT,pygame.K_RIGHT):
+                                 pygame.K_UP,pygame.K_DOWN,pygame.K_LEFT,pygame.K_RIGHT,
+                                 pygame.K_LSHIFT,pygame.K_RSHIFT,pygame.K_j,pygame.K_k,
+                                 pygame.K_l,pygame.K_q):
                     self.held_keys.add(event.key)
+                if self.modal=='profile_edit':
+                    if event.key in (pygame.K_RETURN,pygame.K_KP_ENTER):self.do_action('profile_save',None)
+                    elif event.key==pygame.K_ESCAPE:
+                        pygame.key.stop_text_input();pygame.key.set_repeat();self.modal='profile'
+                    else:
+                        self.bio_draft,self.bio_cursor,_=self.edit_text_event(
+                            event,self.bio_draft,self.bio_cursor,None,90)
+                    continue
                 if self.modal=='name_edit':
                     if event.key in (pygame.K_RETURN,pygame.K_KP_ENTER):self.do_action('name_save',None)
                     elif event.key==pygame.K_ESCAPE:
@@ -1475,7 +1631,7 @@ class Game:
                     elif self.modal=='settings':self.do_action('settings_back',None)
                     elif self.modal=='notice_zoom':self.modal='notices'
                     elif self.modal is not None:
-                        if self.modal in ('join','name_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
+                        if self.modal in ('join','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
                         self.modal=None
                     elif self.scene=='world':self.modal='pause'
                 elif self.modal=='story' and event.key in (pygame.K_e,pygame.K_SPACE,pygame.K_RETURN):
@@ -1490,6 +1646,7 @@ class Game:
                     elif event.key==pygame.K_m:self.modal='missions'
                     elif event.key==pygame.K_h:self.modal='help'
                     elif event.key==pygame.K_f:self.modal='friends'
+                    elif event.key==pygame.K_p:self.do_action('profile',None)
                     elif event.key==pygame.K_c:self.modal='costume'
                     elif event.key==pygame.K_b:self.modal='event'
                     elif event.key==pygame.K_q:
@@ -1538,49 +1695,63 @@ class Game:
         s=self.world_layer
         x=int(wx-self.camera[0]);y=int(wy-self.camera[1])
         if x>BASE_W+200 or y>VIEW_HEIGHT+200 or x+width<-200 or y+height<-200:return
-        pygame.draw.rect(s,(38,69,51),(x+8,y+height-4,width-12,14))
-        pygame.draw.rect(s,(229,201,137),(x+7,y+31,width-14,height-29))
-        for xx in range(x+25,x+width-20,63):
-            pygame.draw.rect(s,(99,137,138),(xx,y+52,32,30))
-            pygame.draw.rect(s,(75,56,39),(xx+13,y+52,5,30))
-        roof_top=y+8
-        roof_bottom=y+48
-        pygame.draw.polygon(s,(122,63,48),((x+1,roof_bottom),(x+width//2,roof_top),(x+width-1,roof_bottom)))
-        pygame.draw.line(s,(213,142,91),(x+10,roof_bottom-6),(x+width//2,roof_top+5),4)
-        pygame.draw.line(s,(83,43,39),(x+width//2,roof_top+5),(x+width-10,roof_bottom-6),5)
+        sprite=self.building_sprites.get(kind)
+        pygame.draw.ellipse(s,(54,92,62),(x+8,y+height-12,width-16,22))
+        if sprite is not None:
+            # Images are source pixel art, nearest-neighbor only.
+            s.blit(pygame.transform.scale(sprite,(width,height)),(x,y))
+        else:
+            pygame.draw.rect(s,(231,198,141),(x,y,width,height))
+            pygame.draw.polygon(s,(139,78,55),((x,y+height//3),(x+width//2,y),(x+width,y+height//3)))
         dx=int(door_pos[0]-self.camera[0]);dy=int(door_pos[1]-self.camera[1])
-        pygame.draw.rect(s,(133,108,72),(dx-26,y+height,52,max(3,dy-(y+height)+10)))
-        pygame.draw.rect(s,(94,56,47),(dx-20,y+height-55,40,55))
-        pygame.draw.rect(s,(239,213,144),(dx+8,y+height-31,4,4))
-        sign=(193,179,102) if kind=='shop' else (161,185,119)
-        pygame.draw.rect(s,sign,(x+width//2-67,y+48,134,31),border_radius=2)
-        text(s,self.fonts,name,(x+width//2,y+64),18,INK,True,True)
+        # Stone doorstep visually marks where E is used.
+        pygame.draw.rect(s,(193,169,122),(dx-19,y+height-1,38,max(8,dy-(y+height)+8)))
+        # Labels are separate from the pixel art to keep Japanese text crisp.
+        pygame.draw.rect(s,(248,233,177),(x+width//2-76,y+int(height*.41)-17,152,33),border_radius=4)
+        pygame.draw.rect(s,(92,68,47),(x+width//2-76,y+int(height*.41)-17,152,33),2,border_radius=4)
+        text(s,self.fonts,name,(x+width//2,y+int(height*.41)-1),17,INK,True,True,max_width=141)
 
     def make_ground_layer(self):
-        """Render terrain once. Moving the camera now uses a fast surface blit."""
-        ground = pygame.Surface((WORLD_W * TILE, WORLD_H * TILE)).convert()
-        ground.fill((86,147,76))
+        """Cache a complete pixel-art overworld: districts, cobbles, flower beds."""
+        ground=pygame.Surface((WORLD_W*TILE,WORLD_H*TILE)).convert()
+        ground.fill((91,155,86))
         for ty in range(WORLD_H):
             for tx in range(WORLD_W):
-                x=tx*TILE;y=ty*TILE
-                shade=(84,150,76) if (tx*13+ty*7)%7 else (93,160,82)
-                pygame.draw.rect(ground,shade,(x,y,TILE,TILE))
-                if (tx*149+ty*101)%13==0:
-                    pygame.draw.rect(ground,(113,172,78),(x+7,y+9,5,3))
-                    pygame.draw.rect(ground,(53,109,48),(x+11,y+8,3,9))
-                if (tx*19+ty*11)%17==0:
-                    pygame.draw.rect(ground,(166,189,95),(x+24,y+24,3,3))
-                # Paths connecting home, fields, stores and mission board.
-                on_horizontal=(ty in (9,10,11,20,21) and 7<=tx<=42)
-                on_vertical=(tx in (22,23,24,35,36) and 10<=ty<=28)
-                on_entrance=(37<=tx<=43 and ty in (13,14,27,28))
-                if on_horizontal or on_vertical or on_entrance:
-                    pygame.draw.rect(ground,(186,153,100),(x,y,TILE,TILE))
-                    if (tx*11+ty*5)%9==0:pygame.draw.rect(ground,(165,132,85),(x+5,y+18,9,4))
-                if 3<=tx<=13 and 26<=ty<=32:
-                    pygame.draw.rect(ground,(71,128,164),(x,y,TILE,TILE))
-                    if (tx*7+ty*3)%4==0:
-                        pygame.draw.rect(ground,(116,181,185),(x+10,y+14,12,2))
+                x,y=tx*TILE,ty*TILE
+                n=(tx*113+ty*71+tx*ty*17)%17
+                base=(93+n//4,151+n//3,80+n//3)
+                if 6<=tx<=20 and 10<=ty<=22:base=(109+n//4,157+n//3,88+n//3)
+                pygame.draw.rect(ground,base,(x,y,TILE,TILE))
+                if water_at(tx,ty):
+                    pygame.draw.rect(ground,(66+n,129+n,170+n//2),(x,y,TILE,TILE))
+                    if n%3==0:
+                        pygame.draw.rect(ground,(127,191,196),(x+7,y+12,15,3))
+                        pygame.draw.rect(ground,(102,175,191),(x+14,y+17,10,2))
+                    continue
+                if plaza_at(tx,ty):
+                    pygame.draw.rect(ground,(194+n//3,180+n//4,150+n//4),(x,y,TILE,TILE))
+                    pygame.draw.rect(ground,(168,152,120),(x,y,31,1))
+                    pygame.draw.rect(ground,(169,153,123),(x,y,1,31))
+                    pygame.draw.rect(ground,(221,207,175),(x+3,y+3,24,22),1)
+                elif path_at(tx,ty):
+                    pygame.draw.rect(ground,(193+n//3,159+n//4,110+n//4),(x,y,TILE,TILE))
+                    pygame.draw.rect(ground,(161,132,93),(x+2,y+16,28,1))
+                    if (tx+ty)%3==0:
+                        pygame.draw.rect(ground,(219,184,135),(x+8,y+4,6,3))
+                elif flower_at(tx,ty):
+                    for fx,fy in ((7,17),(17,7),(23,21)):
+                        pygame.draw.rect(ground,(54,116,55),(x+fx,y+fy+2,2,7))
+                        pygame.draw.rect(ground,(244,190,102) if n%2 else (238,167,192),(x+fx-2,y+fy,6,5))
+                        pygame.draw.rect(ground,(247,226,152),(x+fx,y+fy+1,2,2))
+                elif n%6==0:
+                    pygame.draw.rect(ground,(78,135,67),(x+12,y+16,3,8))
+                    pygame.draw.rect(ground,(137,182,93),(x+9,y+12,8,3))
+        # Wooden planks marking the lakeside fishing pier.
+        for tx in range(12,16):
+            x,y=tx*TILE,29*TILE
+            pygame.draw.rect(ground,(104,70,46),(x,y+5,32,24))
+            pygame.draw.rect(ground,(190,140,89),(x+2,y+7,28,19))
+            pygame.draw.line(ground,(112,77,51),(x+17,y+7),(x+17,y+26),2)
         return ground
 
     def draw_world(self):
@@ -1588,13 +1759,14 @@ class Game:
         self.camera_update()
         cx,cy=self.camera
         w.blit(self.ground_layer, (0, 0), pygame.Rect(int(cx), int(cy), BASE_W, VIEW_HEIGHT))
-        # Lakeshore details and an east-bank boardwalk to the fishing location.
-        for tx in range(12,16):
-            x=int(tx*TILE-cx);y=int(29*TILE-cy)
-            pygame.draw.rect(w,(130,88,51),(x,y+7,32,22))
-            pygame.draw.rect(w,(198,145,86),(x,y+6,32,6))
-            pygame.draw.rect(w,(92,61,41),(x+2,y+5,4,27))
-            pygame.draw.rect(w,(92,61,41),(x+27,y+5,4,27))
+        # Carriage signposts: consistent with fast travel actions and map pins.
+        for label,(stop_name,(wx,wy)) in TRAVEL_STOPS.items():
+            x,y=int(wx-cx),int(wy-cy)
+            if x < -80 or x > BASE_W+80 or y < -80 or y > VIEW_HEIGHT+80:continue
+            pygame.draw.rect(w,(99,69,50),(x-3,y-31,6,43))
+            pygame.draw.rect(w,(237,219,162),(x-24,y-37,48,28))
+            pygame.draw.rect(w,(107,74,48),(x-24,y-37,48,28),2)
+            text(w,self.fonts,'馬車',(x,y-25),15,INK,True,True)
         # Fishing float marker / pier sign.
         px=int(FISH_PIER[0]-cx);py=int(FISH_PIER[1]-cy)
         pygame.draw.rect(w,(102,66,46),(px-3,py-40,7,39))
@@ -1651,6 +1823,16 @@ class Game:
         pygame.draw.rect(w,(108,66,44),(bx-5,by-4,46,37),4)
         pygame.draw.rect(w,(175,91,61),(bx+4,by+10,29,4))
         pygame.draw.rect(w,(175,91,61),(bx+8,by+20,19,3))
+        # Market-square fountain and festival planters (non-solid scenery).
+        fx=int(31*TILE-cx);fy=int(17*TILE-cy)
+        pygame.draw.ellipse(w,(106,115,95),(fx-45,fy-13,88,50))
+        pygame.draw.ellipse(w,(134,195,193),(fx-37,fy-12,72,38))
+        pygame.draw.ellipse(w,(191,220,209),(fx-22,fy-9,41,25),3)
+        for tx,ty in ((22,13),(34,13),(22,21),(34,21),(41,12),(15,22)):
+            dx=int(tx*TILE-cx);dy=int(ty*TILE-cy)
+            pygame.draw.rect(w,(131,87,55),(dx+8,dy+13,17,17))
+            pygame.draw.rect(w,(67,128,69),(dx+5,dy+3,21,14))
+            pygame.draw.rect(w,(234,167,184),(dx+13,dy+2,7,7))
         for building in BUILDINGS:
             self.draw_house(building.tile_x*TILE,building.tile_y*TILE,
                             building.tile_w*TILE,building.tile_h*TILE,
@@ -1716,6 +1898,7 @@ class Game:
         pygame.draw.rect(s,(31,49,37),(0,VIEW_TOP+VIEW_HEIGHT,BASE_W,BASE_H-(VIEW_TOP+VIEW_HEIGHT)))
         day,h,m=clock_at(self.state)
         text(s,self.fonts,'アンベラ牧場',(23,12),27,CREAM,True)
+        text(s,self.fonts,'地域：'+district_at(*self.player),((607 if self.online_client else 25),49),13,GOLD_LIGHT,True,max_width=270)
         if self.online_client:text(s,self.fonts,f'ONLINE {len(self.remote_players)+1}/{8}  PIN {self.room_pin}',(22,53),13,GOLD_LIGHT,True)
         if self.show_performance:
             ping = self.online_client.latency_ms if self.online_client else None
@@ -1741,7 +1924,7 @@ class Game:
                     _,rdy,ready=progress_for(p)
                     msg=f'E {"収穫" if ready else "様子を見る"}  |  {CROP_BY_ID[p["crop"]].name} {time_short(rdy)}'
             else:
-                labels={'shop':'たね屋の内装へ','shipping':'出荷所の内装へ','missions':'ミッションを見る','home':'自宅へ入る','fishing':'釣りを始める','fish_market':'魚市場の内装へ','general_store':'雑貨屋へ','hall':'集会所へ','fisherman':'ナギと話す','guide':'ミオと話す','merchant':'店主と話す'}
+                labels={'shop':'たね屋の内装へ','shipping':'出荷所の内装へ','missions':'ミッションを見る','home':'自宅へ入る','fishing':'釣りを始める','fish_market':'魚市場の内装へ','general_store':'道具・雑貨屋へ','hall':'集会所へ','workshop':'衣装工房へ','cafe':'カフェへ','greenhouse':'温室へ','travel':'馬車で移動する','fisherman':'ナギと話す','guide':'ミオと話す','merchant':'店主と話す'}
                 msg=('E  '+labels[action]) if action in labels else 'WASD 移動 | F9 脱出 | E 調べる | I 持ち物 | G 協力出荷 | T チャット | Esc メニュー'
         text(s,self.fonts,msg,(22,VIEW_TOP+VIEW_HEIGHT+18),18,CREAM,True,max_width=1040)
         self.ui_button((1094,VIEW_TOP+VIEW_HEIGHT+12,165,42),'メニュー','overlay','pause',size=18)
@@ -1752,11 +1935,11 @@ class Game:
         s=self.stage
         pygame.draw.rect(s,(38,56,42),(x-8,y-8,201,148),border_radius=6)
         pygame.draw.rect(s,(162,191,120),(x,y,185,129))
-        points=(('畑',12,15,(110,70,43)),('種屋',40,12,(232,180,79)),
-                ('出荷',40,27,(188,92,62)),('掲示板',26,16,(111,90,174)),
-                ('自宅',9,7,(230,226,177)),('湖',8,29,(71,128,164)),
-                ('魚市場',26,29,(87,160,209)),
-                ('雑貨屋',32,7,(238,207,88)),('集会所',50,24,(170,111,177)))
+        style={'home':(244,223,179),'shop':(230,172,73),'general_store':(92,143,198),
+               'workshop':(178,121,203),'greenhouse':(95,187,143),'hall':(170,108,177),
+               'shipping':(186,104,64),'fish_market':(77,152,198),'cafe':(217,114,132)}
+        points=[(b.label,b.tile_x+b.tile_w/2,b.tile_y+b.tile_h/2,style[b.key]) for b in BUILDINGS]
+        points += [('畑',13,16,(110,70,43)),('掲示板',26,16,(111,90,174)),('湖',8,29,(71,128,164))]
         for label,wx,wy,clr in points:
             px=x+int(wx/WORLD_W*185);py=y+int(wy/WORLD_H*129)
             pygame.draw.rect(s,clr,(px-4,py-4,9,9))
@@ -1848,10 +2031,12 @@ class Game:
             x,y=203+col*443,185+row*74
             box(self.stage,(x,y,421,67),CREAM,BROWN,5,2)
             self.assets.draw_crop(self.stage,c.id,(x+5,y+9,49,49))
-            text(self.stage,self.fonts,c.name,(x+66,y+7),19,INK,True,max_width=158)
-            text(self.stage,self.fonts,f'{c.buy_price}G / 所持 {self.state["seeds"][c.id]}',(x+66,y+39),16,GREEN_DARK)
-            self.ui_button((x+245,y+11,75,45),'+1','buy',(c.id,1),disabled=self.state['coins']<c.buy_price,size=17)
-            self.ui_button((x+327,y+11,78,45),'+5','buy',(c.id,5),disabled=self.state['coins']<c.buy_price*5,size=17)
+            text(self.stage,self.fonts,c.name,(x+64,y+2),17,INK,True,max_width=160)
+            text(self.stage,self.fonts,c.note,(x+64,y+22),13,BROWN,max_width=166)
+            text(self.stage,self.fonts,f'{c.buy_price}G / 所持 {self.state["seeds"][c.id]}',(x+64,y+43),14,GREEN_DARK)
+            self.ui_button((x+246,y+11,48,45),'+1','buy',(c.id,1),disabled=self.state['coins']<c.buy_price,size=15)
+            self.ui_button((x+302,y+11,48,45),'+5','buy',(c.id,5),disabled=self.state['coins']<c.buy_price*5,size=15)
+            self.ui_button((x+359,y+11,48,45),'+10','buy',(c.id,10),disabled=self.state['coins']<c.buy_price*10,size=13)
         text(self.stage,self.fonts,'※ キュウリと金のリンゴも初版では一度だけ収穫できます。',(218,643),15,GREEN_DARK)
 
     def draw_shipping(self):
@@ -2118,9 +2303,9 @@ class Game:
         self.ui_button((794,585,222,40),'一覧へ戻る','notice_back',size=16)
 
     def draw_interior(self):
-        names={'home':'自宅','shop':'たね屋','shipping':'出荷所','fish_market':'魚市場','general_store':'雑貨屋','hall':'集会所'}
+        names={'home':'自宅','shop':'たね屋','shipping':'出荷所','fish_market':'魚市場','general_store':'道具・雑貨屋','hall':'集会所','greenhouse':'温室','workshop':'衣装工房','cafe':'カフェ'}
         name=names.get(self.interior,'建物')
-        self.overlay_panel(name+'  /  建物の中','屋内の家具を配置した仮内装。ここから施設機能を利用できます。')
+        self.overlay_panel(name+'  /  建物の中','家具や看板を調べて、施設ごとの機能を利用しよう。')
         # Depth/perspective room with rug, furniture, shelf, doorway
         pygame.draw.rect(self.stage,(180,152,112),(238,164,805,390))
         pygame.draw.rect(self.stage,(232,206,158),(251,175,780,276))
@@ -2149,18 +2334,69 @@ class Game:
             for j in range(4):
                 pygame.draw.rect(self.stage,(145,87,56),(273+j*113,331,84,107))
                 pygame.draw.circle(self.stage,(238,214-j*20,139),(303+j*113,354),15)
+        elif self.interior=='greenhouse':
+            for j in range(5):
+                pygame.draw.rect(self.stage,(98,73,47),(284+j*72,356,48,78))
+                pygame.draw.circle(self.stage,(82,149,76),(308+j*72,349),21)
+        elif self.interior=='cafe':
+            for xx in (307,720):
+                pygame.draw.circle(self.stage,(131,86,62),(xx,388),49)
+                pygame.draw.circle(self.stage,(211,168,124),(xx,388),42)
+        elif self.interior=='workshop':
+            pygame.draw.rect(self.stage,(150,104,135),(288,332,130,95))
+            for i in range(5):pygame.draw.rect(self.stage,OUTFIT_COLORS[i],(305+i*92,350,54,54))
         elif self.interior=='hall':
             pygame.draw.rect(self.stage,(126,75,53),(438,321,393,107))
-            text(self.stage,self.fonts,'MINI GAME',(640,352),32,GOLD_LIGHT,True,True)
+            text(self.stage,self.fonts,'AMBERA ARENA',(640,352),29,GOLD_LIGHT,True,True)
         text(self.stage,self.fonts,{'home':'ベッド・収納箱','shop':'種の棚・レジ','shipping':'出荷用木箱・伝票','fish_market':'氷の台・魚の水槽',
-                                  'general_store':'飲食物と道具の棚','hall':'大会のステージ・掲示板'}[self.interior],(641,295),24,BROWN,True,True)
+                                  'general_store':'飲食物と道具の棚','hall':'大会のステージ・掲示板','greenhouse':'苗床と日替わり依頼','workshop':'衣装の生地と型紙','cafe':'休憩とフレンド交流'}[self.interior],(641,295),24,BROWN,True,True)
         if self.interior=='home':
-            self.ui_button((408,475,214,55),'セーブ管理','data_menu',size=19)
-            self.ui_button((663,475,214,55),'着せ替え','costume',size=19)
+            self.ui_button((277,468,218,55),'収納箱を開く','chest',size=18)
+            self.ui_button((520,468,218,55),'ベッドで休憩','home_rest',size=18)
+            self.ui_button((765,468,218,55),'セーブ管理','data_menu',size=18)
+        elif self.interior=='greenhouse':
+            self.ui_button((482,472,316,58),'村の依頼掲示板','daily_board',size=21)
+        elif self.interior=='workshop':
+            self.ui_button((482,472,316,58),'衣装を作る','costume',size=21)
+        elif self.interior=='cafe':
+            self.ui_button((285,469,334,58),'飲み物・食べ物','interior_open','general_store',size=18)
+            self.ui_button((658,469,334,58),'フレンド確認','friends',size=18)
         else:
             destination={'general_store':'general_store','hall':'duel'}.get(self.interior,self.interior)
-            caption='ミニゲーム練習' if self.interior=='hall' else 'お店を利用する'
-            self.ui_button((482,472,316,58),caption,'interior_open',destination,size=21)
+            if self.interior=='hall':
+                self.ui_button((288,469,339,58),'カブボール・アリーナ','arena',size=20)
+                self.ui_button((659,469,339,58),'従来ミニゲーム','duel',size=20)
+            else:
+                self.ui_button((482,472,316,58),'お店を利用する','interior_open',destination,size=21)
+
+    def draw_chest(self):
+        self.overlay_panel('自宅の収納箱  /  MY STORAGE','種・作物・魚・食べ物を安全に預けられます。自分のアイテムだけが表示されます。')
+        group=self.chest_category
+        for i,(category,label) in enumerate((('seeds','種'),('warehouse','収穫物'),
+                                             ('fish_inventory','魚'),('consumables','食べ物'))):
+            self.ui_button((216+i*212,160,201,45),label,'chest_category',category,
+                           selected=(group==category),size=17)
+        keys=STORAGE_IDS[group]
+        start=self.chest_page*6
+        from fishing_core import FISH_BY_ID
+        for i,ident in enumerate(keys[start:start+6]):
+            y=221+i*64
+            stock=self.state[group][ident]
+            stored=self.state['home_chest'][group][ident]
+            if group=='consumables':label=ITEMS[ident][0]
+            elif group=='fish_inventory':label=FISH_BY_ID[ident].name
+            else:label=CROP_BY_ID[ident].name
+            box(self.stage,(216,y,850,58),CREAM,BROWN,5,2)
+            text(self.stage,self.fonts,label,(230,y+8),18,INK,True,max_width=180)
+            text(self.stage,self.fonts,f'手持ち {stock}  /  収納 {stored}',(231,y+32),14,GREEN_DARK)
+            self.ui_button((550,y+9,110,40),'預ける1','chest_move',(group,ident,1,False),disabled=stock<1,size=15)
+            self.ui_button((668,y+9,110,40),'全部預ける','chest_move',(group,ident,-1,False),disabled=stock<1,size=14)
+            self.ui_button((787,y+9,110,40),'引き出す1','chest_move',(group,ident,1,True),disabled=stored<1,size=15)
+            self.ui_button((904,y+9,148,40),'全部引き出す','chest_move',(group,ident,-1,True),disabled=stored<1,size=14)
+        page_count=max(1,(len(keys)+5)//6)
+        text(self.stage,self.fonts,f'{self.chest_page+1} / {page_count} ページ',(643,618),17,BROWN,True,True)
+        self.ui_button((475,600,95,41),'◀','chest_page',-1,disabled=self.chest_page<=0,size=17)
+        self.ui_button((718,600,95,41),'▶','chest_page',1,disabled=self.chest_page>=page_count-1,size=17)
 
     def draw_store(self):
         self.overlay_panel('雑貨屋 / 回復アイテム','スタミナは5ハート。クワ・水やり・種まき・収穫で各1ハート消費。')
@@ -2237,7 +2473,8 @@ class Game:
             box(self.stage,(251,y,779,57),CREAM,BROWN,5,2)
             text(self.stage,self.fonts,p['name'],(272,y+15),20,INK,True,max_width=280)
             is_friend=p.get('uid') in self.state['friend_ids']
-            self.ui_button((780,y+7,219,43),'フレンド登録済み' if is_friend else '申請する',
+            self.ui_button((625,y+7,142,43),'プロフィール','friend_profile',p.get('uid'),size=15)
+            self.ui_button((788,y+7,211,43),'フレンド登録済み' if is_friend else '申請する',
                            'friend_request',p['id'],disabled=is_friend,size=16)
         if not self.remote_players:
             text(self.stage,self.fonts,'同じオンライン部屋の参加者はいません。',(640,246),19,INK,False,True)
@@ -2245,13 +2482,253 @@ class Game:
             invite=self.friend_invites[0]
             text(self.stage,self.fonts,invite['name']+' から申請が届いています',(356,564),17,RED,True)
             self.ui_button((817,547,187,49),'承認する','friend_accept',invite['id'],size=16)
-        text(self.stage,self.fonts,'登録済み：'+('、'.join(self.state['friends'][:14]) or 'なし'),(263,636),15,GREEN_DARK,max_width=770)
+        text(self.stage,self.fonts,'登録済み：'+('、'.join(self.state['friends'][:14]) or 'なし'),(263,634),15,GREEN_DARK,max_width=770)
+        if not self.remote_players:
+            cached=self.state.get('profile_cache',{})
+            for i,uid in enumerate(self.state['friend_ids'][:4]):
+                if uid in cached:
+                    y=310+i*58
+                    info=cached[uid]
+                    text(self.stage,self.fonts,info.get('name','フレンド'),(277,y+6),19,INK,True)
+                    self.ui_button((767,y,232,39),'保存したプロフィール','friend_profile',uid,size=15)
+
+    def draw_profile(self):
+        own=self.profile_view_uid is None or self.profile_view_uid==self.state['player_uid']
+        info=public_profile(self.state) if own else None
+        if not own:
+            for p in self.remote_players:
+                if p.get('uid')==self.profile_view_uid and isinstance(p.get('public_profile'),dict):
+                    info=p['public_profile'];break
+            if info is None:info=self.state.get('profile_cache',{}).get(self.profile_view_uid)
+        self.overlay_panel('プロフィール / PROFILE','プレイヤーの公開情報（所持品・お金・セーブ内容は非公開）')
+        if not info:
+            text(self.stage,self.fonts,'このプレイヤーのプロフィールはまだ取得できません。',(640,337),23,BROWN,True,True)
+            return
+        title_label=TITLE_LABELS.get(info.get('title'),'駆け出し牧場主')
+        box(self.stage,(247,171,782,129),CREAM,BROWN,6,2)
+        text(self.stage,self.fonts,info.get('name','牧場主'),(267,186),29,BROWN,True,max_width=440)
+        text(self.stage,self.fonts,title_label,(269,237),19,GREEN_DARK,True)
+        text(self.stage,self.fonts,f'農場 Lv.{info.get("farm_level",1)}',(821,206),23,BROWN,True)
+        box(self.stage,(247,312,782,96),PALE,BROWN,5,2)
+        text(self.stage,self.fonts,'自己紹介',(266,321),18,BROWN,True)
+        bio=info.get('bio') or '自己紹介はまだありません。'
+        # Two lines without shrinking to unreadably small characters.
+        lines=self.wrap_notice(bio,735,18,max_lines=3)
+        for i,line in enumerate(lines[:2]):text(self.stage,self.fonts,line,(269,348+i*25),18,INK)
+        rec=info.get('arena_record',{})
+        text(self.stage,self.fonts,
+             f'カブボール  {rec.get("wins",0)}勝  {rec.get("losses",0)}敗  {rec.get("draws",0)}分  / レート {rec.get("rating",1000)}',
+             (265,438),22,INK,True,max_width=750)
+        if own:
+            self.ui_button((264,505,300,51),'自己紹介を編集','profile_edit',size=19)
+            keys=unlocked_titles(self.state)
+            here=self.state.get('profile_title','farmer')
+            k=(keys.index(here)+1)%len(keys) if here in keys else 0
+            self.ui_button((616,505,380,51),'称号変更 → '+TITLE_LABELS[keys[k]],'profile_title',keys[k],size=16)
+            self.ui_button((264,575,350,50),'村の依頼と農場レベル','daily_board',size=17)
+            effect=self.state.get('goal_effect',0)
+            next_effect=(effect+1)%3
+            self.ui_button((642,575,351,50),'ゴール演出 '+('通常','葉っぱ','星')[effect]+' →','goal_effect',next_effect,size=16)
+        else:
+            self.ui_button((448,554,387,54),'フレンド一覧へ戻る','friends',size=19)
+
+    def draw_profile_edit(self):
+        self.overlay_panel('プロフィール / 自己紹介を編集','90文字まで入力。Enterで保存 / Escで戻る。')
+        box(self.stage,(266,219,755,141),WHITE,BROWN,7,3)
+        f=self.fonts.get(22)
+        visible=self.bio_draft
+        lines=self.wrap_notice(visible,715,22,max_lines=3)
+        for i,line in enumerate(lines[:3]):text(self.stage,self.fonts,line,(289,238+i*34),22,INK)
+        text(self.stage,self.fonts,f'{len(self.bio_draft)}/90文字',(288,386),18,GREEN_DARK)
+        self.ui_button((468,481,343,65),'保存する','profile_save',size=23)
+
+    def draw_daily_board(self):
+        refresh_progress(self.state)
+        self.overlay_panel('村の依頼掲示板 / DAILY','農業と釣りでレベルアップ。毎日更新される3件の依頼を達成しよう！')
+        xp=int(self.state.get('farm_xp',0));level=int(self.state.get('farm_level',1))
+        target=50*level*(level+1)
+        text(self.stage,self.fonts,f'農場レベル {level}  /  経験値 {xp} XP   次のレベル: {target} XP',
+             (256,166),21,BROWN,True)
+        for i,o in enumerate(board_rows(self.state)):
+            y=230+i*126
+            box(self.stage,(247,y,785,104),CREAM,BROWN,6,2)
+            text(self.stage,self.fonts,o['name'],(267,y+10),21,INK,True)
+            text(self.stage,self.fonts,f'{o["progress"]}/{o["target"]}　報酬 {o["coins"]}G・{o["xp"]}XP',
+                 (267,y+49),18,GREEN_DARK)
+            disabled=o['progress']<o['target'] or o['claimed']
+            self.ui_button((802,y+24,196,53),'受取済み' if o['claimed'] else ('報酬を受取' if not disabled else '未達成'),
+                           'daily_claim',o['id'],disabled=disabled,size=17)
+
+    def draw_arena_lobby(self):
+        self.overlay_panel('アンベラ・アリーナ / KABUBALL','本格1対1カブボール！ 通常対戦／練習。Gを賭ける対戦はサーバー安全対策待ち。')
+        arena=self.arena_state if self.online_client else None
+        if arena and arena.get('status')=='active':
+            self.modal='arena_match'
+            self.draw_arena_match()
+            return
+        if arena and arena.get('status')=='pending':
+            text(self.stage,self.fonts,'相手：'+arena.get('opponent','Player'),(640,239),27,BROWN,True,True)
+            if arena.get('side')==0:
+                text(self.stage,self.fonts,'相手の承諾を待っています。',(640,307),20,INK,True,True)
+                self.ui_button((465,396,348,55),'招待を取り消す','arena_cancel',size=19)
+            else:
+                text(self.stage,self.fonts,'カブボールの対戦招待が届いています。',(640,301),20,INK,True,True)
+                self.ui_button((303,402,305,58),'対戦する','arena_accept',size=21)
+                self.ui_button((662,402,305,58),'断る','arena_reject',size=21)
+            return
+        if arena and arena.get('status') in ('canceled','finished'):
+            text(self.stage,self.fonts,arena.get('reason') or '対戦終了。次の試合に挑戦できます。',
+                 (640,193),17,BROWN,True,True)
+        self.ui_button((238,241,345,65),'1人で練習（CPU戦）','arena_practice',size=21)
+        self.ui_button((691,241,346,65),'プロフィール・戦績','profile',size=19)
+        self.ui_button((691,310,346,39),'賭け対戦（未公開）','arena_bet',disabled=True,size=16)
+        text(self.stage,self.fonts,'集会所の参加者に対戦を申し込む',(260,333),20,BROWN,True)
+        if self.online_client:
+            if not self.remote_players:text(self.stage,self.fonts,'ほかの参加者がいません。',(268,387),19,INK)
+            for i,p in enumerate(self.remote_players[:3]):
+                y=374+i*61
+                text(self.stage,self.fonts,p['name'],(275,y+12),20,INK,True)
+                self.ui_button((764,y,231,49),'対戦に招待','arena_challenge',p['id'],size=17)
+        else:
+            text(self.stage,self.fonts,'オンラインの部屋に参加すると対人戦に挑めます。',(260,386),19,INK)
+        text(self.stage,self.fonts,'部屋内ランキング（接続しているプレイヤー）',(260,570),16,GREEN_DARK,True)
+        leaders=self.arena_leaders[:3]
+        for i,p in enumerate(leaders):
+            text(self.stage,self.fonts,f'{i+1}位 {p["name"]}  レート{p["rating"]}',(271+i*267,603),15,INK,max_width=251)
+        text(self.stage,self.fonts,'通常対戦はG消費なし。賭け対戦・全体マッチング・2対2は将来の基盤整備後に対応。',
+             (640,654),14,GREEN_DARK,False,True,max_width=835)
+
+    def draw_arena_match(self):
+        from kabuball_core import GOAL_TOP,GOAL_BOTTOM
+        arena=(self.practice_match.view('local') if self.practice_match is not None else self.arena_state)
+        if not arena:
+            self.modal='arena';self.draw_arena_lobby();return
+        self.overlay_panel('カブボール / KABUBALL','WASD移動 | Shiftダッシュ | J長押しでシュート | K奪取 | Qフェイント | Lクイックキック')
+        def loc(x,y):
+            return int(232+(x-LEFT)/(RIGHT-LEFT)*815),int(208+(y-TOP)/(BOTTOM-TOP)*350)
+        field=pygame.Rect(232,208,815,350)
+        box(self.stage,field,(119,168,99),(67,112,57),8,4)
+        for j in range(7):
+            if j%2==0:pygame.draw.rect(self.stage,(131,178,107),(234+j*116,210,115,347))
+        pygame.draw.line(self.stage,WHITE,loc(480,95),loc(480,445),3)
+        pygame.draw.circle(self.stage,WHITE,loc(480,270),61,3)
+        pygame.draw.rect(self.stage,(72,113,162),pygame.Rect(*loc(120,210),17,int(120/(BOTTOM-TOP)*350)),3)
+        pygame.draw.rect(self.stage,(183,73,61),pygame.Rect(loc(840,210)[0]-17,loc(840,210)[1],17,int(120/(BOTTOM-TOP)*350)),3)
+        for j,p in enumerate(arena.get('players',[])):
+            xx,yy=loc(p['x'],p['y'])
+            color=(69,100,218) if j==0 else (202,75,61)
+            pygame.draw.circle(self.stage,(37,49,32),(xx+2,yy+4),17)
+            pygame.draw.circle(self.stage,color,(xx,yy),16)
+            pygame.draw.circle(self.stage,WHITE,(xx,yy),16,2)
+            if j==arena.get('side'):pygame.draw.circle(self.stage,GOLD_LIGHT,(xx,yy),21,2)
+        b=arena.get('ball',{})
+        if b:
+            xx,yy=loc(b.get('x',480),b.get('y',270))
+            pygame.draw.circle(self.stage,(232,226,194),(xx,yy),11)
+            pygame.draw.circle(self.stage,(82,137,73),(xx+3,yy-5),4)
+            pygame.draw.circle(self.stage,BROWN,(xx,yy),11,2)
+        score=arena.get('scores',[0,0]);remain=int(arena.get('remaining',180))
+        key=(arena.get('id'),tuple(score))
+        if self.arena_last_score_key is not None and key[0]==self.arena_last_score_key[0] and key[1]!=self.arena_last_score_key[1]:
+            self.goal_celebration=time.monotonic()
+        self.arena_last_score_key=key
+        since=time.monotonic()-self.goal_celebration
+        if 0<=since<1.5:
+            effect=self.state.get('goal_effect',0)
+            for i in range(12):
+                angle=2*math.pi*i/12
+                radius=int(32+since*160)
+                pos=(int(640+math.cos(angle)*radius),int(370+math.sin(angle)*radius*.55))
+                color=GOLD_LIGHT if effect==0 else (GREEN_LIGHT if effect==1 else WHITE)
+                if 220<pos[0]<1040 and 214<pos[1]<556:
+                    pygame.draw.circle(self.stage,color,pos,4 if effect<2 else 7)
+            text(self.stage,self.fonts,'GOAL !!',(640,347),43,GOLD_LIGHT,True,True)
+        text(self.stage,self.fonts,f'青 {score[0]}  -  {score[1]} 赤',(639,164),28,BROWN,True,True)
+        text(self.stage,self.fonts,f'残り {remain//60}:{remain%60:02d}'+('  延長戦' if arena.get('overtime') else ''),
+             (820,170),17,RED,True)
+        if arena['status']=='finished':
+            result=('勝利！' if score[arena['side']]>score[1-arena['side']] else
+                    '敗北' if score[arena['side']]<score[1-arena['side']] else '引き分け')
+            box(self.stage,(439,308,404,127),PAPER,BROWN,9,5)
+            text(self.stage,self.fonts,result,(640,341),33,BROWN,True,True)
+            text(self.stage,self.fonts,'対戦成績を保存しました' if not self.practice_match else '練習終了',
+                 (640,396),18,GREEN_DARK,False,True)
+            self.ui_button((439,577,186,51),'ロビーへ','arena_leave',size=18)
+            if self.practice_match:
+                self.ui_button((660,577,182,51),'もう一戦','arena_replay',size=18)
+            else:
+                caption='申請済み（待機中）' if arena.get('replay') else '再戦を申し込む'
+                self.ui_button((656,577,211,51),caption,'arena_online_replay',disabled=bool(arena.get('replay')),size=16)
+        elif arena['status']=='canceled':
+            text(self.stage,self.fonts,arena.get('reason','試合は中止されました'),(640,584),22,RED,True,True)
+            self.ui_button((540,612,200,43),'ロビーへ','arena_leave',size=18)
+        else:
+            self_pts=arena.get('players',[])
+            me=self_pts[arena['side']] if len(self_pts)==2 else None
+            if me:
+                bar(self.stage,pygame.Rect(255,580,335,17),me['stamina']/100,GREEN,BROWN)
+                bar(self.stage,pygame.Rect(615,580,130,17),me.get('charge',0),GOLD,BROWN)
+            text(self.stage,self.fonts,'スタミナ',(256,600),15,GREEN_DARK,True)
+            text(self.stage,self.fonts,'シュート威力',(614,600),15,GREEN_DARK,True)
+            if arena.get('start_in',0)>0:
+                text(self.stage,self.fonts,f'開始まで {math.ceil(arena["start_in"])}',(642,361),37,WHITE,True,True)
+            if self.practice_match:self.ui_button((774,586,206,44),'練習を終了','arena_leave',size=16)
+        text(self.stage,self.fonts,'※対戦はホスト方式。Gを預ける賭けモードは無効。',(640,647),14,GREEN_DARK,False,True)
+
+    def tick_arena(self,dt):
+        keys=self.held_keys
+        dx=int(pygame.K_d in keys or pygame.K_RIGHT in keys)-int(pygame.K_a in keys or pygame.K_LEFT in keys)
+        dy=int(pygame.K_s in keys or pygame.K_DOWN in keys)-int(pygame.K_w in keys or pygame.K_UP in keys)
+        arena=(self.practice_match.view('local') if self.practice_match else self.arena_state)
+        if not arena or arena.get('status')!='active':return
+        me=arena['players'][arena['side']]
+        mx,my=self.mouse
+        # Screen-to-arena conversion follows draw_arena_match's field transform.
+        aim_x=LEFT+(mx-232)/815*(RIGHT-LEFT)-me['x']
+        aim_y=TOP+(my-208)/350*(BOTTOM-TOP)-me['y']
+        command={'dx':dx,'dy':dy,'ax':aim_x,'ay':aim_y,
+                 'dash':pygame.K_LSHIFT in keys or pygame.K_RSHIFT in keys,
+                 'shoot':pygame.K_j in keys,'tackle':pygame.K_k in keys,
+                 'feint':pygame.K_q in keys,'pass':pygame.K_l in keys}
+        if self.practice_match is not None:
+            m=self.practice_match
+            m.update_input('local',command)
+            cpu=m.players[1]
+            target=m.ball
+            # Basic server-style CPU: chase the ball, shoot toward the player's goal.
+            cx,cy=(target['x'],target['y'])
+            ddx=cx-cpu['x'];ddy=cy-cpu['y']
+            owned=target.get('owner')=='cpu'
+            m.update_input('cpu',{'dx':(-1 if owned else ddx),'dy':(270-cpu['y'] if owned else ddy),
+                           'ax':-1,'ay':0,'shoot':owned and abs(cpu['y']-270)<95 and time.monotonic()%1.5<.8,
+                           'dash':abs(ddx)+abs(ddy)>120,'tackle':abs(ddx)+abs(ddy)<60})
+            m.step(time.monotonic())
+        elif self.online_client and time.monotonic()-self.last_arena_input>=1/20:
+            self.online_client.send('arena_input',input=command)
+            self.last_arena_input=time.monotonic()
+
+    def draw_travel(self):
+        self.overlay_panel('アンベラ町の馬車  /  FAST TRAVEL','停留所から主要エリアに移動できます。徒歩でもすべての施設に行けます。')
+        for i,(key,(name,_)) in enumerate(TRAVEL_STOPS.items()):
+            x=257+(i%2)*383;y=230+(i//2)*163
+            box(self.stage,(x,y,363,132),CREAM,BROWN,8,3)
+            text(self.stage,self.fonts,name,(x+20,y+17),23,INK,True)
+            self.ui_button((x+19,y+68,325,47),'この場所へ移動','travel_to',key,size=18)
+        text(self.stage,self.fonts,'※ オンラインでは部屋ホストが移動先を判定します。',(637,601),17,BROWN,False,True)
 
     def draw_map(self):
         self.overlay_panel('拡大マップ  /  MAP','現在地と主要施設を確認できます。Escで戻ります。')
         r=pygame.Rect(268,171,743,417)
         pygame.draw.rect(self.stage,(166,194,122),r,border_radius=5)
         def proj(tx,ty):return int(r.x+tx/WORLD_W*r.w),int(r.y+ty/WORLD_H*r.h)
+        for ty in range(WORLD_H):
+            for tx in range(WORLD_W):
+                if water_at(tx,ty):
+                    x,y=proj(tx,ty)
+                    pygame.draw.rect(self.stage,(76,146,185),(x,y,max(1,int(r.w/WORLD_W)+1),max(1,int(r.h/WORLD_H)+1)))
+                elif path_at(tx,ty):
+                    x,y=proj(tx,ty)
+                    pygame.draw.rect(self.stage,(218,192,137),(x,y,max(1,int(r.w/WORLD_W)+1),max(1,int(r.h/WORLD_H)+1)))
         for b in BUILDINGS:
             bx,by=proj(b.tile_x,b.tile_y)
             bw=int(b.tile_w/WORLD_W*r.w);bh=int(b.tile_h/WORLD_H*r.h)
@@ -2259,8 +2736,9 @@ class Game:
             text(self.stage,self.fonts,b.label,(bx,by-17),12,BROWN,True)
         for tx,ty in TREE_POSITIONS:
             pygame.draw.circle(self.stage,(63,130,61),proj(tx,ty),3)
-        lx,ly=proj(8,29)
-        pygame.draw.ellipse(self.stage,(81,147,188),(lx-60,ly-32,110,75))
+        for stop,(_,pos) in TRAVEL_STOPS.items():
+            wx,wy=proj(pos[0]/TILE,pos[1]/TILE)
+            pygame.draw.rect(self.stage,(232,181,80),(wx-5,wy-5,10,10))
         px,py=proj(self.player[0]/TILE,self.player[1]/TILE)
         pygame.draw.circle(self.stage,WHITE,(px,py),9)
         pygame.draw.circle(self.stage,RED,(px,py),6)
@@ -2336,14 +2814,15 @@ class Game:
                   ('種と倉庫','overlay','inventory'),('ミッション','overlay','missions'),
                   ('遊び方','help_menu',None),('お知らせ'+(' NEW' if unseen else ''),'notices',None),
                   ('衣装','costume',None),('イベント','event',None),('データ管理','data_menu',None),
-                  ('メール','mail',None),('フレンド','friends',None),('MAP','map',None)]
+                  ('メール','mail',None),('フレンド','friends',None),('MAP','map',None),
+                  ('プロフィール P','profile',None),('村の依頼','daily_board',None)]
         labels.append(('チャットを開く T','chat',None))
         labels.append(('みんなで共同出荷 G','coop_board',None))
         labels.append(('タイトルへ戻る','return_title',None))
         for i,(label,act,val) in enumerate(labels):
             x=241+(i%3)*281
-            y=153+(i//3)*78
-            self.ui_button((x,y,254,55),label,act,val,size=16)
+            y=151+(i//3)*65
+            self.ui_button((x,y,254,51),label,act,val,size=15)
         text(self.stage,self.fonts,'F5 セーブ  /  F6 書き出し  /  F7 読み込み',
              (640,564),18,GREEN_DARK,False,True)
         if self.online_client:
@@ -2516,7 +2995,13 @@ class Game:
             elif self.modal=='event':self.draw_event()
             elif self.modal=='mail':self.draw_mail()
             elif self.modal=='friends':self.draw_friends()
+            elif self.modal=='profile':self.draw_profile()
+            elif self.modal=='profile_edit':self.draw_profile_edit()
+            elif self.modal=='daily_board':self.draw_daily_board()
+            elif self.modal=='arena':self.draw_arena_lobby()
+            elif self.modal=='arena_match':self.draw_arena_match()
             elif self.modal=='map':self.draw_map()
+            elif self.modal=='travel':self.draw_travel()
             elif self.modal=='data_manage':self.draw_data_manage()
             elif self.modal=='duel':self.draw_duel()
             elif self.modal=='chat':self.draw_chat()
@@ -2527,6 +3012,7 @@ class Game:
             elif self.modal=='shop':self.draw_shop()
             elif self.modal=='shipping':self.draw_shipping()
             elif self.modal=='inventory':self.draw_inventory()
+            elif self.modal=='chest':self.draw_chest()
             elif self.modal=='missions':self.draw_missions()
             elif self.modal=='pause':self.draw_pause()
             elif self.modal=='help':self.draw_help()
@@ -2556,6 +3042,8 @@ class Game:
             if self.online_client:
                 self.poll_network()
                 self.interpolate_remote_positions(dt)
+            if self.scene=='world' and self.modal=='arena_match':
+                self.tick_arena(dt)
             elif self.scene=='world' and time.monotonic()-self.last_save_time>=30:self.persist(True)
             if self.update_status and (not self.message or time.monotonic()>self.message_until):
                 self.say(self.update_status,9);self.update_status=''
@@ -2577,7 +3065,19 @@ def main():
                 raise RuntimeError('Bundled crop sprites are missing')
             if len(probe.story_nodes) == 0:
                 raise RuntimeError('Bundled story events are missing')
-            probe.render()
+            if len(probe.building_sprites) != len(BUILDINGS):
+                raise RuntimeError('New town building PNG assets are missing')
+            probe.render()  # title screen
+            probe.scene='world'
+            probe.modal=None
+            probe.render()  # scrolling terrain, village buildings and HUD
+            for place in ('home','shop','greenhouse','general_store','workshop','cafe','shipping','hall','fish_market'):
+                probe.interior=place
+                probe.modal='interior'
+                probe.render()  # catches missing room labels and UI mapping
+            for modal in ('chest','travel','map','shop','inventory','daily_board'):
+                probe.modal=modal
+                probe.render()  # new screens, map and storage buttons
             pygame.quit()
             return
         Game().run()

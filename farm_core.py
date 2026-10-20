@@ -166,7 +166,9 @@ def validate_state(raw):
     from v8_features import validate_v8
     for field in ('stamina','stamina_updated_at','plot_preparation','consumables','outfits','outfit_index',
                   'outfit_draft','friends','player_uid','friend_ids','local_chat','player_name','mail_claimed',
-                  'event_tokens','event_claimed','event_earned_on','event_daily_count'):
+                  'event_tokens','event_claimed','event_earned_on','event_daily_count',
+                  'farm_xp','farm_level','farm_stat_seen','daily_board','profile_bio','profile_title',
+                  'profile_cache','arena_record','goal_effect','home_chest'):
         if field in raw:
             initial[field]=raw[field]
     try:

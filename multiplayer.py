@@ -24,16 +24,20 @@ from farm_core import (plant, harvest, buy_seeds, sell_crops, claim_mission,
                        new_state)
 from fishing_core import FISH_BY_ID, add_catch, sell_fish
 from story_engine import finish_story
-from world_map import can_stand, plot_world, INTERACTION_POINTS
+from world_map import can_stand, plot_world, INTERACTION_POINTS, TRAVEL_STOPS, nearest_travel_stop
 from farm_mailbox import load as load_public_mail
 from v8_features import (field_action, buy_consumable, use_consumable, init_v8, restore_stamina,
                          exchange_event, new_outfit, OUTFIT_COLORS, receive_public_mail)
+from town_features import move_chest, rest_in_bed
 from coop_orders import new_board, view as board_view, contribute as contribute_order
+from kabuball_core import KabuballMatch
+from profile_progress import (init_profile, public_profile, refresh_progress,
+                              claim_daily, apply_arena_result, clean_bio, unlocked_titles)
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 5
+PROTOCOL = 7
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -90,6 +94,8 @@ class RoomServer:
         self.friend_invites={}
         self.duels = {}  # temporary server-authoritative mini-game matches
         self.next_duel_id = 0
+        self.arena_matches = {}
+        self.next_arena_id = time.time_ns()
         self.story_nodes = copy.deepcopy(story_nodes or [])
         parent = self
 
@@ -152,6 +158,7 @@ class RoomServer:
                         now = time.monotonic()
                         packets = []
                         with parent.lock:
+                            parent._arena_tick(now)
                             player = parent.players.get(pid)
                             if player is None:
                                 break
@@ -165,11 +172,14 @@ class RoomServer:
                                     'state': merged_view(player['profile'], parent.state['plots'],
                                                          parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
+                                    'arena': parent.arena_view(pid),
+                                    'leaderboard': parent.arena_leaderboard(),
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                        for x in parent.friend_invites.get(pid, []) if x in parent.players],
                                     'story_nodes': parent.story_nodes,
-                                    'players': [{k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')}
+                                    'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')},
+                                                     public_profile=public_profile(member['profile']))
                                                 for member in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
                                     'chat': list(parent.chat_log[-30:]),
@@ -180,12 +190,15 @@ class RoomServer:
                             if now - last_positions >= POSITION_INTERVAL:
                                 positions = tuple((key, round(member['x'], 2), round(member['y'], 2))
                                                   for key, member in parent.players.items())
-                                if positions != last_position_hash or now - last_position_sent >= 1.0:
+                                arena_running=parent.arena_view(pid) and parent.arena_view(pid)['status']=='active'
+                                if positions != last_position_hash or now - last_position_sent >= 1.0 or arena_running:
                                     packets.append({
                                         'type': 'positions',
-                                        'players': [{k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')}
+                                        'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')},
+                                                         public_profile=public_profile(member['profile']))
                                                     for member in parent.players.values()],
                                         'self_pos': [player['x'], player['y']],
+                                        'arena': parent.arena_view(pid),
                                     })
                                     last_position_hash = positions
                                     last_position_sent = now
@@ -220,14 +233,21 @@ class RoomServer:
                             kind = incoming.get('type')
                             if kind == 'move':
                                 parent._move(pid, incoming)
+                            elif kind == 'arena_input':
+                                parent._arena_input(pid, incoming.get('input'))
                             elif kind == 'action':
                                 result = parent._action(pid, incoming)
                                 # Notify peers quickly (also for friend/duel changes).
                                 parent.world_revision += 1
                                 profile = parent.players[pid]['profile']
                                 response = {'type': 'result', 'message': result,
+                                    'warp_to': list(TRAVEL_STOPS[incoming.get('value')][1])
+                                        if incoming.get('action')=='travel' and isinstance(result,str)
+                                        and result.startswith('馬車で移動') else None,
                                     'state': merged_view(profile, parent.state['plots'], parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
+                                    'arena': parent.arena_view(pid),
+                                    'leaderboard': parent.arena_leaderboard(),
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                       for x in parent.friend_invites.get(pid, []) if x in parent.players]}
@@ -245,6 +265,7 @@ class RoomServer:
                     if pid:
                         with parent.lock:
                             parent._duel_disconnect(pid)
+                            parent._arena_disconnect(pid)
                             parent.friend_invites.pop(pid,None)
                             for invites in parent.friend_invites.values():
                                 if pid in invites:invites.remove(pid)
@@ -345,9 +366,100 @@ class RoomServer:
                     owner['profile']['friend_ids'].append(peer['uid'])
                 if peer['name'] not in owner['profile']['friends']:
                     owner['profile']['friends'].append(peer['name'])
+                owner['profile']['profile_cache'][peer['uid']]=public_profile(peer['profile'])
             self._save_host()
             return 'フレンドになりました！'
         return '対応していない申請です'
+
+    def arena_view(self,pid):
+        now=time.monotonic()
+        eligible=[m for m in self.arena_matches.values() if pid in m.ids
+                  and (m.status in ('pending','active') or now-m.ended_at<35)]
+        if eligible:
+            m=max(eligible,key=lambda x:(x.status in ('pending','active'),x.id))
+            view=m.view(pid,now)
+            enemy=m.ids[1-view['side']]
+            view['opponent']=self.players.get(enemy,{}).get('name','相手')
+            return view
+        return None
+
+    def arena_leaderboard(self):
+        values=[]
+        for player in self.players.values():
+            rec=player['profile']['arena_record']
+            values.append({'name':player['name'], 'rating':rec['rating'], 'wins':rec['wins'], 'uid':player['uid']})
+        return sorted(values,key=lambda x:(-x['rating'],-x['wins'],x['name']))[:8]
+
+    def _arena_tick(self,now=None):
+        now=time.monotonic() if now is None else now
+        for ident,m in list(self.arena_matches.items()):
+            if m.status=='pending' and now-m.created>40:
+                m.abort(now)
+            if m.status=='active':m.step(now)
+            if m.status=='finished' and not m.completed:
+                # Unique completion; no virtual-currency transfers in LAN games.
+                for idx,pid in enumerate(m.ids):
+                    player=self.players.get(pid)
+                    opponent=self.players.get(m.ids[1-idx])
+                    if player is None or opponent is None:continue
+                    apply_arena_result(player['profile'],m.scores[idx],m.scores[1-idx],
+                        opponent['name'],m.id)
+                m.completed=True
+                self.world_revision+=1
+                try:self._save_host()
+                except (OSError,SaveError):pass
+            if m.status in ('finished','canceled') and now-m.ended_at>40:
+                self.arena_matches.pop(ident,None)
+
+    def _arena_disconnect(self,pid):
+        for m in self.arena_matches.values():
+            if pid in m.ids and m.status in ('pending','active'):
+                m.reason='相手が切断しました。試合は無効です。'
+                m.abort()
+                self.world_revision+=1
+
+    def _arena_input(self,pid,data):
+        m=next((m for m in self.arena_matches.values() if pid in m.ids and m.status=='active'),None)
+        if m is not None:m.update_input(pid,data)
+
+    def _arena_action(self,pid,action,data):
+        me=self.players[pid]
+        near=lambda p:math.dist((p['x'],p['y']),INTERACTION_POINTS['hall'])<=120
+        match=next((m for m in self.arena_matches.values() if pid in m.ids and m.status in ('pending','active')),None)
+        finished=next((m for m in reversed(list(self.arena_matches.values())) if pid in m.ids and m.status=='finished'),None)
+        if action=='arena_challenge':
+            if match:return 'すでに対戦中です'
+            if not isinstance(data,dict) or data.get('stake',0)!=0:
+                return 'ゲーム内Gを賭ける機能は安全な中央サーバーができるまで無効です'
+            target=self.players.get(data.get('target'))
+            if not target or target is me or not near(me) or not near(target):
+                return '集会所の近くにいるプレイヤーを選んでください'
+            if any(target['id'] in m.ids and m.status in ('pending','active') for m in self.arena_matches.values()):
+                return '相手はすでに対戦中です'
+            self.next_arena_id+=1
+            m=KabuballMatch(self.next_arena_id,pid,target['id'])
+            self.arena_matches[m.id]=m
+            return 'カブボールの招待を送りました！'
+        if action=='arena_replay':
+            if match is not None or finished is None or time.monotonic()-finished.ended_at>35:
+                return '再戦できる相手が見つかりません'
+            finished.invited_replay.add(pid)
+            if len(finished.invited_replay)==2 and all(x in self.players for x in finished.ids):
+                self.next_arena_id+=1
+                newer=KabuballMatch(self.next_arena_id,*finished.ids)
+                self.arena_matches[newer.id]=newer
+                newer.accept()
+                return '再戦が始まります！'
+            return '再戦を申請しました。相手の承諾待ちです'
+        if match is None:return '対戦が見つかりません'
+        if action=='arena_accept' and match.status=='pending' and pid==match.ids[1]:
+            if not all(x in self.players for x in match.ids):return '参加者が切断しました'
+            match.accept();return 'カブボール開始！ WASD移動・Jシュート・K奪取'
+        if action=='arena_reject' and match.status=='pending' and pid==match.ids[1]:
+            match.reason='相手が招待を断りました';match.abort();return '招待を断りました'
+        if action=='arena_cancel' and match.status=='pending':
+            match.reason='招待が取り消されました';match.abort();return '招待を取り消しました'
+        return '現在この操作はできません'
 
     def _duel_action(self,pid,action,data):
         """Room-only competitive games; only virtual G. Two-party consent & escrow.
@@ -432,10 +544,59 @@ class RoomServer:
                 try:self._save_host()
                 except (OSError,SaveError):return '納品結果のセーブに失敗しました（ホストに連絡してください）'
             return result
+        if isinstance(action,str) and action.startswith('arena_'):
+            return self._arena_action(pid,action,data)
+        if action=='profile_bio':
+            if not isinstance(data,str) or len(data)>90:return '自己紹介は90文字以内です'
+            profile['profile_bio']=clean_bio(data)
+            for other in self.players.values():
+                if p['uid'] in other['profile']['friend_ids']:
+                    other['profile']['profile_cache'][p['uid']]=public_profile(profile)
+            self._save_host();return '自己紹介を更新しました'
+        if action=='goal_effect':
+            if type(data) is not int or data not in (0,1,2) or (data==1 and profile['arena_record']['wins']<1) or (data==2 and profile['arena_record']['wins']<5):
+                return 'ゴール演出は勝利数によって解放されます'
+            profile['goal_effect']=data
+            self._save_host();return 'ゴール演出を変更しました'
+        if action=='profile_title':
+            if data not in unlocked_titles(profile):return '未取得の称号です'
+            profile['profile_title']=data
+            for other in self.players.values():
+                if p['uid'] in other['profile']['friend_ids']:
+                    other['profile']['profile_cache'][p['uid']]=public_profile(profile)
+            self._save_host();return '称号を設定しました'
+        if action=='daily_claim':
+            refresh_progress(profile)
+            if claim_daily(profile,data):
+                self._save_host();return '村の依頼を達成しました！'
+            return '依頼がまだ未達成か、受取済みです'
         if action in ('friend_request','friend_accept'):
             return self._friend_action(pid,action,data)
         if isinstance(action,str) and action.startswith('duel_'):
             return self._duel_action(pid,action,data)
+        if action == 'travel':
+            from_stop=nearest_travel_stop(p['x'],p['y'],75)
+            if not isinstance(data,str) or data not in TRAVEL_STOPS or from_stop is None:
+                return '馬車の停留所に近づいてください'
+            target_name,(tx,ty)=TRAVEL_STOPS[data]
+            if not can_stand(tx,ty):return '行き先に障害物があります'
+            now=time.monotonic()
+            if now-p.get('last_travel',0)<2.0:return '馬車の次の便を待ってください'
+            if any(pid in match.ids and match.status in ('pending','active')
+                   for match in self.arena_matches.values()):
+                return '対戦中は馬車を使えません'
+            p.update(x=tx,y=ty,last=now,last_travel=now)
+            profile['player']=[tx,ty]
+            self._save_host()
+            return f'馬車で移動しました：{target_name}'
+        if action == 'home_rest' and loc('home', 100):
+            if rest_in_bed(profile):self._save_host();return 'ベッドで休憩して体力が回復しました'
+            return 'すでに元気いっぱいです'
+        if action == 'home_chest' and loc('home', 100):
+            if not isinstance(data,dict):return '収納内容が不正です'
+            if move_chest(profile,data.get('category'),data.get('item'),data.get('count'),data.get('withdraw',False)):
+                self._save_host();return '自宅の収納を更新しました'
+            return '持ち物の数を確認してください'
         if action == 'rescue':
             now = time.monotonic()
             if now - p['last_rescue'] < 12:
@@ -506,6 +667,7 @@ class RoomServer:
             else:
                 return '施設から離れているか、不明な操作です'
             if ok:
+                refresh_progress(profile)
                 self._save_host()
                 return '反映しました（お金・所持品・ミッションは個人別）'
             return '操作できませんでした（所持数や育成状況を確認してください）'
