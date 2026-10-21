@@ -19,7 +19,7 @@ def collect(client, kind, timeout=2):
 
 
 def test_position_updates_are_separate_and_smaller(tmp_path):
-    assert PROTOCOL == 7
+    assert PROTOCOL == 9
     assert POSITION_INTERVAL < STATE_INTERVAL
     room = RoomServer(new_state(), tmp_path / 'room.json', port=0)
     a = b = None

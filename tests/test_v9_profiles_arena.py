@@ -117,7 +117,7 @@ def test_charge_and_shoot_release():
 
 
 def test_server_arena_start_and_results_with_private_money(tmp_path):
-    assert PROTOCOL==7
+    assert PROTOCOL== 9
     host=new_state();guest=new_state()
     room=RoomServer(host,tmp_path/'arena.json',port=0)
     a=b=None
