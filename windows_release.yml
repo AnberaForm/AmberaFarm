@@ -32,6 +32,8 @@ jobs:
         shell: pwsh
         run: |
           python -m compileall -q .
+          python tools/check_pixel_assets.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest -q tests
           if ('${{ github.ref_type }}' -eq 'tag') {
             python verify_release_tag.py --tag '${{ github.ref_name }}'

@@ -17,23 +17,26 @@ PROP_REGIONS = ((25,52,284,320), (345,105,286,260), (649,79,257,266), (929,114,3
 
 class PixelArt:
     def __init__(self, root):
-        root = Path(root)/'assets'
+        self.project_root = Path(root)
+        root = self.project_root/'assets'
         self.maps = {}
         self.room_views = {}
         self.sprites = {}
         self.scaled = {}
+        self.asset_errors = {}
+        self.sprite_errors = {}
         for spec in MAPS.values():
             if spec.asset in self.maps: continue
             path = root/'scenes'/(spec.asset+'.png')
-            if path.is_file():
-                raw = pygame.image.load(str(path)).convert()
+            raw = self.load_image(path, alpha=False)
+            if raw is not None:
                 self.maps[spec.asset] = pygame.transform.scale(raw, spec.size)
                 if spec.size == (1280, 768):
                     self.room_views[spec.asset] = pygame.transform.scale(self.maps[spec.asset], (960, 576))
         for name, columns, rows, keys in (('props', 4, 4, PROPS), ('fish', 4, 2, FISH_IDS)):
             path = root/'scenery'/(name+'.png')
-            if not path.is_file(): continue
-            sheet = pygame.image.load(str(path)).convert_alpha()
+            sheet = self.load_image(path, alpha=True)
+            if sheet is None: continue
             for index, key in enumerate(keys):
                 column, row = index%columns, index//columns
                 if name == 'props':
@@ -45,10 +48,52 @@ class PixelArt:
                 else:
                     left, right = round(column*sheet.get_width()/columns), round((column+1)*sheet.get_width()/columns)
                     top, bottom = round(row*sheet.get_height()/rows), round((row+1)*sheet.get_height()/rows)
+                if right<=left or bottom<=top:
+                    self.sprite_errors[key] = f'assets/scenery/{name}.png: sprite region is empty or too small'
+                    continue
                 sprite = sheet.subsurface((left, top, right-left, bottom-top)).copy()
                 bounds = sprite.get_bounding_rect(min_alpha=128)
                 if bounds.width and bounds.height:
                     self.sprites[key] = sprite.subsurface(bounds).copy()
+                else:
+                    self.sprite_errors[key] = f'assets/scenery/{name}.png: sprite region is fully transparent'
+
+    def load_image(self, path, alpha):
+        relative = path.relative_to(self.project_root).as_posix()
+        if not path.is_file():
+            self.asset_errors[relative] = 'missing file'
+            return None
+        try:
+            raw = pygame.image.load(str(path))
+            return raw.convert_alpha() if alpha else raw.convert()
+        except (OSError, pygame.error) as error:
+            self.asset_errors[relative] = 'could not decode image: '+str(error)
+            return None
+
+    def diagnostics(self):
+        expected = len({spec.asset for spec in MAPS.values()})
+        lines = [f'Pixel-art assets: backgrounds {len(self.maps)}/{expected}, '
+                 f'sprites {len(self.sprites)}/{len(PROPS)+len(FISH_IDS)}']
+        for relative, reason in sorted(self.asset_errors.items()):
+            lines.append(f'  {relative}: {reason}')
+            # Point out common upload layouts without accepting wrong paths.
+            path = Path(relative)
+            for alternative in (self.project_root/'assets'/path,
+                                self.project_root/'assets'/path.name,
+                                self.project_root/path.name):
+                if alternative.is_file():
+                    actual = alternative.relative_to(self.project_root).as_posix()
+                    lines.append(f'    Found at {actual}; move it to {relative}')
+        for key, reason in sorted(self.sprite_errors.items()):
+            lines.append(f'  Sprite {key}: {reason}')
+        if not self.complete():
+            lines.append('Upload assets/scenes/*.png and assets/scenery/{props,fish}.png '
+                         'to the repository root with those exact folder names.')
+        return '\n'.join(lines)
+
+    def require_complete(self):
+        if not self.complete():
+            raise RuntimeError('Pixel-art asset check failed:\n'+self.diagnostics())
 
     def sprite(self, key, size):
         cache_key = key, tuple(size)
@@ -68,5 +113,6 @@ class PixelArt:
         return True
 
     def complete(self):
-        return (len(self.maps) == len({spec.asset for spec in MAPS.values()})
+        return (not self.asset_errors and not self.sprite_errors
+                and len(self.maps) == len({spec.asset for spec in MAPS.values()})
                 and all(key in self.sprites for key in (*PROPS, *FISH_IDS)))

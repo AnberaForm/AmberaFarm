@@ -3969,8 +3969,7 @@ def main():
                 raise RuntimeError('Missing character images')
             if len(probe.avatar_atlas.frames)!=len(AVATARS)*16:
                 raise RuntimeError('Missing directional walking sprites')
-            if not probe.pixel_art.complete():
-                raise RuntimeError('Missing pixel-art map or scenery assets')
+            probe.pixel_art.require_complete()
             if len(probe.item_icons)!=3:
                 raise RuntimeError('Missing consumable sprites')
             probe.render()  # title screen
