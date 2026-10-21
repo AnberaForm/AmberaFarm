@@ -39,21 +39,74 @@ class FishingRound:
     bobber_y: float = .5
     progress: float = 0.
     tension: float = 0.
-    remaining: float = 35.
+    remaining: float = 28.
     elapsed: float = 0.
     result: str = ''  # 'caught' or 'escaped'
+    seed: int | None = None
+    bobber_velocity: float = 0.
+    struggling: bool = False
+
+    def __post_init__(self):
+        if self.fish_id not in FISH_BY_ID:
+            raise ValueError('不明な魚です')
+        self.seed = random.randrange(2**31) if self.seed is None else int(self.seed)
+        self._rng = random.Random(self.seed)
+        self._turn_in = self._rng.uniform(.6, 1.25)
+        self._surge_in = self._rng.uniform(1.7, 2.7)
+        self._surge_left = 0.
+        self._accumulator = 0.
+
+    @property
+    def tolerance(self):
+        return .142 - (FISH_BY_ID[self.fish_id].difficulty-1)*.018
+
+    def view(self):
+        fields = ('fish_id', 'fish_y', 'fish_direction', 'bobber_y', 'progress',
+                  'tension', 'remaining', 'elapsed', 'result', 'struggling')
+        return {k: getattr(self, k) for k in fields}
+
+    @classmethod
+    def from_view(cls, view):
+        round_ = cls(view['fish_id'], seed=0)
+        for key in round_.view():
+            if key in view:
+                setattr(round_, key, view[key])
+        return round_
 
     def step(self, dt, direction=0, reeling=False):
         """Advance by seconds, no real-time clock dependency. Direction -1/up or +1/down."""
         if self.result:
             return self.result
+        try:
+            dt = float(dt)
+        except (TypeError, ValueError, OverflowError):
+            return self.result
+        if not math.isfinite(dt) or dt <= 0:
+            return self.result
+        # Fixed physics steps make difficulty independent of monitor FPS.
+        self._accumulator += min(dt, .12)
+        while self._accumulator >= 1/120 and not self.result:
+            self._accumulator -= 1/120
+            self._step(1/120, direction, reeling)
+        return self.result
+
+    def _step(self, dt, direction, reeling):
         fish = FISH_BY_ID[self.fish_id]
-        dt = max(0, min(float(dt), .12))
+        difficulty = fish.difficulty
         self.remaining = max(0., self.remaining - dt)
         self.elapsed += dt
-        speed = .19 + fish.difficulty * .055
-        # periodic dashes, but deterministic for replay/tests
-        dart = 1.0 + .40 * abs(math.sin(self.elapsed * (1.3 + fish.difficulty * .37)))
+        self._turn_in -= dt
+        if self._turn_in <= 0:
+            self.fish_direction = self._rng.choice((-1, 1))
+            self._turn_in += self._rng.uniform(.45, 1.3) / (1 + .08*difficulty)
+        self._surge_in -= dt
+        if self._surge_in <= 0:
+            self._surge_left = self._rng.uniform(.32, .50) + .045*difficulty
+            self._surge_in += self._rng.uniform(2., 3.3)
+        self._surge_left = max(0., self._surge_left-dt)
+        self.struggling = self._surge_left > 0
+        speed = .225 + difficulty * .056
+        dart = (1.7 if self.struggling else 1.) + .22*abs(math.sin(self.elapsed*(1.9+difficulty*.31)))
         self.fish_y += speed * dart * dt * self.fish_direction
         if self.fish_y >= .96:
             self.fish_y = .96
@@ -61,18 +114,20 @@ class FishingRound:
         elif self.fish_y <= .04:
             self.fish_y = .04
             self.fish_direction = 1
-        self.bobber_y = max(.025, min(.975, self.bobber_y + (1 if direction > 0 else -1 if direction < 0 else 0) * dt * 1.25))
-        tolerance = .19 - (fish.difficulty - 1) * .019
-        locked = abs(self.fish_y - self.bobber_y) <= tolerance
+        desired = (1 if direction > 0 else -1 if direction < 0 else 0) * .94
+        self.bobber_velocity += (desired-self.bobber_velocity)*(1-math.exp(-12*dt))
+        self.bobber_y = max(.025, min(.975, self.bobber_y+self.bobber_velocity*dt))
+        locked = abs(self.fish_y - self.bobber_y) <= self.tolerance
         if reeling:
             if locked:
-                self.progress = min(100., self.progress + dt * (29 - 2 * fish.difficulty))
-                self.tension = max(0., self.tension - dt * 29)
+                self.progress = min(100., self.progress + dt*(22-1.9*difficulty)*(0.28 if self.struggling else 1))
+                self.tension = min(100., self.tension+dt*((40+5*difficulty) if self.struggling else 2+difficulty))
             else:
-                self.progress = max(0., self.progress - dt * 1.6)
-                self.tension = min(100., self.tension + dt * (25 + fish.difficulty * 7))
+                self.progress = max(0., self.progress-dt*(6+1.7*difficulty))
+                self.tension = min(100., self.tension+dt*(39+difficulty*7))
         else:
-            self.tension = max(0., self.tension - dt * 24)
+            self.tension = max(0., self.tension-dt*24)
+            self.progress = max(0., self.progress-dt*(1.2 if locked else 4.5))
         if self.progress >= 100:
             self.result = 'caught'
         elif self.remaining <= 0 or self.tension >= 100:

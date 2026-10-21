@@ -21,13 +21,24 @@ VERSION=ROOT/'version.json'
 ALLOWED={
     'ambera_farm.py','farm_core.py','fishing_core.py','story_engine.py','story_editor.py',
     'world_map.py','multiplayer.py','updater.py','start_game.py',
+    'v8_features.py','player_movement.py','inventory_grid.py','profile_progress.py',
+    'life_hub.py','town_features.py','coop_orders.py','farm_mailbox.py','notices.py',
+    'kabuball_core.py','character_avatars.py','avatar_animation.py','area_world.py',
+    'interior_world.py','neighbor_town.py','save_slots.py','story_admin_auth.py',
     'START_GAME.cmd','DIAGNOSE.cmd','START_STORY_EDITOR.cmd','BUILD_EXE.cmd',
-    'requirements.txt','data/story_events.json',
+    'requirements.txt','data/story_events.json','data/announcements.json','data/mail_campaigns.json',
     *{'assets/crops/'+name+'.png' for name in (
         'kaiware','radish','kabu','ichigo','kyuri','tomato','potato','corn',
         'komugi','kabotya','suika','kin_ringo')},
+    *{'assets/buildings/'+name+'.png' for name in (
+        'home','shop','shipping','fish_market','general_store','hall','greenhouse','workshop','cafe')},
+    *{'assets/avatars/'+name+'_'+str(frame)+'.png' for name in (
+        'original_girl','mint_girl','blue_girl','blonde_girl','farmer_boy','cafe_boy','silver_boy') for frame in range(4)},
+    *{'assets/avatars/'+name+'_walk.png' for name in (
+        'original_girl','mint_girl','blue_girl','blonde_girl','farmer_boy','cafe_boy','silver_boy')},
+    *{'assets/items/'+name+'.png' for name in ('tea','riceball','lunch')},
 }
-MAX_PACKAGE=12*1024*1024
+MAX_PACKAGE=32*1024*1024
 
 def current_version():
     try:return str(json.loads(VERSION.read_text(encoding='utf-8'))['version'])

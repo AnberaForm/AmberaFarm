@@ -148,6 +148,8 @@ def public_profile(s):
     init_profile(s)
     rec=s['arena_record']
     return {'uid':s['player_uid'],'name':s['player_name'],
+        'outfit':({k:s['outfits'][s['outfit_index']][k] for k in ('shirt','hat')}
+                  if s.get('outfit_index',0)>0 else None),
         'bio':clean_bio(s.get('profile_bio','')), 'title':s.get('profile_title','farmer'),
         'farm_level':s['farm_level'], 'avatar_id':s.get('avatar_id','original_girl'), 'favorite_crop':s.get('favorite_crop','kaiware'), 'arena_record':{k:rec[k] for k in ('wins','losses','draws','rating','best_streak')}}
 

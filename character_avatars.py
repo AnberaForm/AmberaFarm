@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Choose one of seven front-view characters, with four mood frames each."""
+"""Seven characters, portrait expressions and sixteen directional walking poses."""
 AVATARS=(
  ('original_girl','花の髪飾り'),
  ('mint_girl','ミントの少女'),

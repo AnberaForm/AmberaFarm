@@ -22,7 +22,7 @@ from pathlib import Path
 from farm_core import (plant, harvest, buy_seeds, sell_crops, claim_mission,
                        SaveError, save_state, PLOT_COUNT, CROP_BY_ID, validate_state,
                        new_state)
-from fishing_core import FISH_BY_ID, add_catch, sell_fish
+from fishing_core import FISH_BY_ID, FishingRound, roll_fish, add_catch, sell_fish
 from story_engine import finish_story
 from world_map import can_stand, plot_world, INTERACTION_POINTS, TRAVEL_STOPS, nearest_travel_stop
 from farm_mailbox import load as load_public_mail
@@ -35,13 +35,16 @@ from coop_orders import new_board, view as board_view, contribute as contribute_
 from kabuball_core import KabuballMatch
 from character_avatars import IDS as AVATAR_IDS
 from neighbor_town import town_buy
+from interior_world import SPAWN as ROOM_SPAWN
+from area_world import (OUTDOOR, NEIGHBOR, AREAS, can_enter, at_facility,
+                        area_view, valid_scene_point, DIRECTIONS)
 from profile_progress import (init_profile, public_profile, refresh_progress,
                               claim_daily, apply_arena_result, clean_bio, unlocked_titles)
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 11
+PROTOCOL = 12
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -144,6 +147,9 @@ class RoomServer:
                             'x': x, 'y': y, 'last': time.monotonic(), 'move_seq': -1, 'move_step_seq': 0,
                             'profile': profile, 'last_chat': 0., 'last_rescue': 0.,
                             'uid':profile['player_uid'], 'emote':'', 'emote_seq':0, 'emote_until':0., 'last_emote':0., 'party_id':None,
+                            'area':OUTDOOR, 'scene_x':ROOM_SPAWN[0], 'scene_y':ROOM_SPAWN[1],
+                            'scene_seq':-1, 'scene_revision':0, 'scene_last':time.monotonic(),
+                            'facing':'down', 'fishing':None,
                         }
                         if is_host:
                             parent.host_id = pid
@@ -160,11 +166,13 @@ class RoomServer:
                     last_position_hash = None
                     last_position_sent = 0.
                     last_ack_seq = -1
+                    last_scene_ack = -1
                     while True:
                         now = time.monotonic()
                         packets = []
                         with parent.lock:
                             parent._arena_tick(now)
+                            parent._fishing_tick(now)
                             player = parent.players.get(pid)
                             if player is None:
                                 break
@@ -185,10 +193,12 @@ class RoomServer:
                                                        for x in parent.friend_invites.get(pid, []) if x in parent.players],
                                     'party': parent.party_view(pid),
                                     'story_nodes': parent.story_nodes,
-                                    'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq')},
+                                    'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq', 'area', 'scene_x', 'scene_y', 'facing')},
                                                      public_profile=public_profile(member['profile']))
                                                 for member in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
+                                    'self_area': area_view(player),
+                                    'fishing': parent.fishing_view(pid),
                                     'move_seq': player['move_seq'],
                                     'move_step_seq': player['move_step_seq'],
                                     'chat': list(parent.chat_log[-30:]),
@@ -197,17 +207,23 @@ class RoomServer:
                                 seen_world_revision = parent.world_revision
                             # Position-only updates: roughly 12Hz; no deep copied profile.
                             if now - last_positions >= POSITION_INTERVAL:
-                                positions = tuple((key, round(member['x'], 2), round(member['y'], 2))
+                                positions = tuple((key, round(member['x'], 2), round(member['y'], 2),
+                                                   member.get('area',OUTDOOR), round(member.get('scene_x',0),2),
+                                                   round(member.get('scene_y',0),2), member.get('scene_revision',0))
                                                   for key, member in parent.players.items())
                                 arena_running=parent.arena_view(pid) and parent.arena_view(pid)['status']=='active'
                                 if (positions != last_position_hash or now - last_position_sent >= 1.0
-                                        or player['move_seq'] != last_ack_seq or arena_running):
+                                        or player['move_seq'] != last_ack_seq
+                                        or player.get('scene_seq',-1) != last_scene_ack
+                                        or arena_running or player.get('fishing')):
                                     packets.append({
                                         'type': 'positions',
-                                        'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq')},
+                                        'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq', 'area', 'scene_x', 'scene_y', 'facing')},
                                                          public_profile=public_profile(member['profile']))
                                                     for member in parent.players.values()],
                                         'self_pos': [player['x'], player['y']],
+                                        'self_area': area_view(player),
+                                        'fishing': parent.fishing_view(pid),
                                         'move_seq': player['move_seq'],
                                     'move_step_seq': player['move_step_seq'],
                                         'arena': parent.arena_view(pid),
@@ -215,6 +231,7 @@ class RoomServer:
                                     last_position_hash = positions
                                     last_position_sent = now
                                     last_ack_seq = player['move_seq']
+                                    last_scene_ack = player.get('scene_seq',-1)
                                 last_positions = now
                             # Chat is a separate, tiny and prompt message.
                             if parent.chat_seq > last_chat_seq and now - last_chat >= CHAT_INTERVAL:
@@ -248,6 +265,10 @@ class RoomServer:
                                 parent._move(pid, incoming)
                             elif kind == 'arena_input':
                                 parent._arena_input(pid, incoming.get('input'))
+                            elif kind == 'area_move':
+                                parent._area_move(pid, incoming)
+                            elif kind == 'fish_input':
+                                parent._fish_input(pid, incoming)
                             elif kind == 'action':
                                 result = parent._action(pid, incoming)
                                 # Notify peers quickly (also for friend/duel changes).
@@ -265,6 +286,8 @@ class RoomServer:
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                       for x in parent.friend_invites.get(pid, []) if x in parent.players],
                                     'party': parent.party_view(pid)}
+                                response['self_area'] = area_view(parent.players[pid])
+                                response['fishing'] = parent.fishing_view(pid)
                             elif kind == 'chat':
                                 parent._chat(pid, incoming.get('message'))
                             elif kind == 'ping':
@@ -333,6 +356,10 @@ class RoomServer:
         acknowledged; the server validates every segment and cumulative speed.
         """
         p = self.players[pid]
+        if p.get('area', OUTDOOR) != OUTDOOR:
+            return
+        if data.get('facing') in DIRECTIONS:
+            p['facing'] = data['facing']
         seq = data.get('seq')
         if type(seq) is int and 0 <= seq <= 2_147_483_647:
             if seq <= p['move_seq']:
@@ -399,6 +426,77 @@ class RoomServer:
                 or not walkable_short_path(start, (x,y), max_length=allowed_distance)):
             return
         p.update(x=x, y=y, last=now)
+
+    def _enter_area(self, pid, target):
+        p = self.players[pid]
+        if not isinstance(target, str) or not can_enter(p, target):
+            return '入口または馬車の停留所に近づいてください'
+        if any(pid in m.ids and m.status in ('pending','active') for m in self.arena_matches.values()):
+            return '対戦中は移動できません'
+        p.update(area=target, scene_x=ROOM_SPAWN[0], scene_y=ROOM_SPAWN[1],
+                 scene_seq=-1, scene_revision=p.get('scene_revision',0)+1,
+                 scene_last=time.monotonic(), fishing=None, facing='up')
+        return '移動しました'
+
+    def _area_move(self, pid, data):
+        p = self.players[pid]
+        seq = data.get('seq')
+        if (p.get('area', OUTDOOR) == OUTDOOR or data.get('area') != p['area']
+                or data.get('revision') != p.get('scene_revision',0)
+                or type(seq) is not int or not 0 <= seq <= 2_147_483_647
+                or seq <= p.get('scene_seq',-1)):
+            return
+        p['scene_seq'] = seq
+        x, y = data.get('x'), data.get('y')
+        if not valid_scene_point(x,y):
+            return
+        now = time.monotonic()
+        allowed = max(14., 205*min(.6,max(0,now-p['scene_last']))*1.35+9)
+        if math.dist((p['scene_x'],p['scene_y']),(x,y)) > allowed:
+            return
+        p.update(scene_x=x, scene_y=y, scene_last=now)
+        if data.get('facing') in DIRECTIONS:
+            p['facing'] = data['facing']
+
+    def fishing_view(self, pid):
+        session = self.players[pid].get('fishing')
+        if session is None:
+            return None
+        return dict(session['round'].view(), id=session['id'])
+
+    def _fish_input(self, pid, data):
+        p = self.players[pid]
+        session = p.get('fishing')
+        direction, reeling = data.get('direction'), data.get('reeling')
+        if (session is None or data.get('id') != session['id']
+                or type(direction) is not int or direction not in (-1,0,1)
+                or type(reeling) is not bool or session['round'].result):
+            return
+        session.update(direction=direction, reeling=reeling, input_at=time.monotonic())
+
+    def _fishing_tick(self, now):
+        changed = False
+        for p in self.players.values():
+            session = p.get('fishing')
+            if session is None or session['round'].result:
+                continue
+            r = session['round']
+            dt = max(0., min(.12,now-session['last']))
+            session['last'] = now
+            if p.get('area',OUTDOOR) != OUTDOOR or not at_facility(p,'fishing',65):
+                r.result = 'escaped'
+            else:
+                fresh = now-session['input_at'] < .4
+                r.step(dt, session['direction'] if fresh else 0, session['reeling'] and fresh)
+            if r.result:
+                changed = True
+                if r.result == 'caught' and not session['claimed']:
+                    add_catch(p['profile'],r.fish_id)
+                    refresh_progress(p['profile'])
+                    session['claimed'] = True
+        if changed:
+            self.world_revision += 1
+            self._save_host()
 
     def duel_view(self,pid):
         now=time.monotonic()
@@ -505,7 +603,7 @@ class RoomServer:
 
     def _arena_action(self,pid,action,data):
         me=self.players[pid]
-        near=lambda p:math.dist((p['x'],p['y']),INTERACTION_POINTS['hall'])<=120
+        near=lambda p:at_facility(p,'hall',120)
         match=next((m for m in self.arena_matches.values() if pid in m.ids and m.status in ('pending','active')),None)
         finished=next((m for m in reversed(list(self.arena_matches.values())) if pid in m.ids and m.status=='finished'),None)
         if action=='arena_challenge':
@@ -533,6 +631,11 @@ class RoomServer:
                 return '再戦が始まります！'
             return '再戦を申請しました。相手の承諾待ちです'
         if match is None:return '対戦が見つかりません'
+        if action=='arena_forfeit' and match.status=='active':
+            match.reason='プレイヤーが対戦から退出しました'
+            match.abort()
+            self.world_revision+=1
+            return '対戦を終了しました'
         if action=='arena_accept' and match.status=='pending' and pid==match.ids[1]:
             if not all(x in self.players for x in match.ids):return '参加者が切断しました'
             match.accept();return 'カブボール開始！ WASD移動・Jシュート・K奪取'
@@ -548,7 +651,7 @@ class RoomServer:
         All scoring uses authoritative server time and server-generated targets.
         """
         me=self.players[pid]
-        nearby=lambda x:math.dist((x['x'],x['y']),INTERACTION_POINTS['hall'])<=100
+        nearby=lambda x:at_facility(x,'hall',100)
         mine=next((d for d in self.duels.values() if pid in (d['a'],d['b']) and d['status']!='finished'),None)
         if action=='duel_challenge':
             if mine or not isinstance(data,dict):return '対戦中、または招待データが不正です'
@@ -616,7 +719,24 @@ class RoomServer:
         # Farm plots and soil preparation are shared; the economy remains private.
         profile['plots'] = self.state['plots']
         profile['plot_preparation'] = self.state['plot_preparation']
-        loc = lambda key, radius: math.dist((p['x'], p['y']), INTERACTION_POINTS[key]) <= radius
+        loc = lambda key, radius: at_facility(p,key,radius)
+        if action == 'area_enter':
+            return self._enter_area(pid,data)
+        if action == 'fish_start':
+            if p.get('area',OUTDOOR) != OUTDOOR or not loc('fishing',65):
+                return '湖の釣り場に近づいてください'
+            active = p.get('fishing')
+            if active and not active['round'].result:
+                return '釣りはすでに始まっています'
+            now = time.monotonic()
+            p['fishing'] = {'id':secrets.token_hex(8), 'round':FishingRound(roll_fish().id),
+                            'last':now, 'input_at':now, 'direction':0, 'reeling':False, 'claimed':False}
+            return '釣り開始！ 魚が暴れたらSPACEを離そう'
+        if action == 'fish_cancel':
+            p['fishing'] = None
+            return '釣りを終了しました'
+        if action == 'fish_caught':
+            return '釣果はホストが判定します'
         # Room-host-validated personal rewards and non-currency social actions.
         if action == 'party_invite':
             target=self.players.get(data) if isinstance(data,str) else None
@@ -651,7 +771,8 @@ class RoomServer:
             return 'キャラクター外観を切り替えました'
         if action == 'neighbor_buy':
             if not isinstance(data,dict):return '購入情報が不正です'
-            if nearest_travel_stop(p['x'],p['y'],100) is None:return '馬車の停留所へ戻ってください'
+            if p.get('area') != NEIGHBOR or math.dist((p['scene_x'],p['scene_y']),(637,300)) > 115:
+                return 'みずほ町のお店に近づいてください'
             if town_buy(profile,data.get('crop'),data.get('count')):
                 self._save_host();return '隣町の種を購入しました'
             return '購入できません。所持金・商品を確認してください'
@@ -680,7 +801,11 @@ class RoomServer:
                     or type(qty) is not int or qty not in (1,2,3)):
                 return '贈り物の宛先・数量が不正です'
             if target['uid'] not in profile.get('friend_ids',[]):return 'フレンドにだけ送れます'
-            if math.dist((p['x'],p['y']),(target['x'],target['y']))>115:
+            if p.get('area',OUTDOOR) != target.get('area',OUTDOOR):
+                return '同じ場所にいるフレンドに近づいてください'
+            a = (p['x'],p['y']) if p.get('area',OUTDOOR)==OUTDOOR else (p['scene_x'],p['scene_y'])
+            b = (target['x'],target['y']) if target.get('area',OUTDOOR)==OUTDOOR else (target['scene_x'],target['scene_y'])
+            if math.dist(a,b)>115:
                 return '相手に近づいてください'
             if profile['consumables'][item]<qty:return 'プレゼントするアイテムが不足しています'
             if target['profile']['consumables'][item]+qty>9999:return '相手の持ち物がいっぱいです'
@@ -727,6 +852,7 @@ class RoomServer:
         if isinstance(action,str) and action.startswith('duel_'):
             return self._duel_action(pid,action,data)
         if action == 'travel':
+            if p.get('area',OUTDOOR) != OUTDOOR:return '町の馬車の停留所に戻ってください'
             from_stop=nearest_travel_stop(p['x'],p['y'],75)
             if not isinstance(data,str) or data not in TRAVEL_STOPS or from_stop is None:
                 return '馬車の停留所に近づいてください'
@@ -753,12 +879,14 @@ class RoomServer:
             now = time.monotonic()
             if now - p['last_rescue'] < 12:
                 return '緊急脱出は12秒ごとに使えます'
-            p.update(x=SPAWN[0], y=SPAWN[1], last=now, last_rescue=now)
+            p.update(x=SPAWN[0], y=SPAWN[1], last=now, last_rescue=now, area=OUTDOOR,
+                     scene_revision=p.get('scene_revision',0)+1, fishing=None)
             p['profile']['player'] = list(SPAWN)
             return '安全な場所に移動しました'
         ok = False
         try:
             if action == 'plot' and isinstance(data, dict):
+                if p.get('area',OUTDOOR) != OUTDOOR:return '畑へ戻ってください'
                 idx, crop = data.get('index'), data.get('crop')
                 if type(idx) is not int or not 0 <= idx < PLOT_COUNT or crop not in CROP_BY_ID:
                     return '畑の指定が不正です'
@@ -769,6 +897,7 @@ class RoomServer:
                 else:
                     ok = harvest(profile, idx) is not None
             elif action == 'field_v8' and isinstance(data, dict):
+                if p.get('area',OUTDOOR) != OUTDOOR:return '畑へ戻ってください'
                 idx,crop=data.get('index'),data.get('crop')
                 if type(idx) is not int or not 0<=idx<PLOT_COUNT or crop not in CROP_BY_ID:
                     return '畑の指定が不正です'
@@ -807,11 +936,6 @@ class RoomServer:
                 if fish_id not in FISH_BY_ID:
                     return '不明な魚'
                 ok = sell_fish(profile, fish_id, profile['fish_inventory'][fish_id] if amount == -1 else amount)
-            elif action == 'fish_caught' and loc('fishing', 65):
-                if data not in FISH_BY_ID:
-                    return '不明な魚'
-                add_catch(profile, data)
-                ok = True
             elif action == 'claim':
                 ok = claim_mission(profile, data)
             elif action == 'story':
@@ -951,7 +1075,7 @@ class RoomClient:
         if not self.active:
             return False
         packet = {'type': kind, **kwargs}
-        if kind == 'move':
+        if kind in ('move','area_move'):
             with self.move_lock:
                 self.latest_move = packet
             return True

@@ -24,6 +24,29 @@ def vector(x,y):
     return (x/length,y/length) if length>1e-8 else (0.,0.)
 
 
+def screen_aim(mouse, player):
+    """Convert screen pixels to a unit vector BEFORE protocol validation."""
+    mx, my = mouse
+    return vector(LEFT + (mx-232)/815*(RIGHT-LEFT) - player['x'],
+                  TOP + (my-208)/350*(BOTTOM-TOP) - player['y'])
+
+
+def cpu_input(match, now, difficulty='normal'):
+    """Bounded input, including at kickoff when the ball is hundreds of px away."""
+    cpu = match.players[1]
+    ball = match.ball
+    owned = ball.get('owner') == cpu['id']
+    dx, dy = vector(-1 if owned else ball['x']-cpu['x'],
+                    (MID_Y-cpu['y'])*.012 if owned else ball['y']-cpu['y'])
+    gap = math.hypot(ball['x']-cpu['x'], ball['y']-cpu['y'])
+    pulse = now % (1.7 if difficulty == 'easy' else 1.25)
+    return {'dx': dx, 'dy': dy, 'ax': -1., 'ay': 0.,
+            'shoot': owned and abs(cpu['y']-MID_Y) < 75 and pulse < .65,
+            'dash': difficulty != 'easy' and (gap > 140 or owned),
+            'tackle': gap < 60 and pulse < .3,
+            'feint': difficulty == 'hard' and owned and pulse < .15}
+
+
 def valid_input(v):
     if not isinstance(v,dict):return None
     try:
