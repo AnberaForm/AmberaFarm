@@ -71,7 +71,7 @@ def test_server_refuses_movement_through_a_solid_tree(tmp_path):
 
 
 def test_ack_rejects_impossible_teleport_then_accepts_nearby(tmp_path):
-    assert PROTOCOL == 9
+    assert PROTOCOL == 10
     room=RoomServer(new_state(),tmp_path/'room.json',port=0)
     client=None
     try:
