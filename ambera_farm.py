@@ -48,7 +48,9 @@ from updater import current_version, get_config, fetch_manifest
 from notices import (load_offline, fetch_public, load_seen, mark_seen,
                      public_view, unread_count, RELEASES_URL)
 from farm_mailbox import load as load_public_mail, fetch as fetch_public_mail
-from inventory_grid import slots as inventory_slots, hotbar as inventory_hotbar, hotbar_offset
+from inventory_grid import (owned_entries, reconcile_layout, entry_at, move_or_swap,
+                            split_stack, quick_transfer, sort_backpack, BACKPACK_SLOTS,
+                            TOTAL_SLOTS)
 from town_features import (init_town, move_chest, rest_in_bed, STORAGE_IDS, STORAGE_NAMES)
 from life_hub import (DECOR, EMOTES, login_reward_view, claim_login_reward, craft_decor,
                       set_decor, claim_all_mail, unread_mail_count)
@@ -316,7 +318,7 @@ def settings_file():
 
 def load_settings():
     initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False, 'fps_limit': 60,
-               'hud_inventory_visible': True, 'quick_quest_visible': True}
+               'hud_inventory_visible': True, 'quick_quest_visible': True, 'inventory_layout': []}
     try:
         data = json.loads(settings_file().read_text(encoding='utf-8-sig'))
         if isinstance(data, dict):
@@ -439,7 +441,11 @@ class Game:
         self.inventory_page='seeds'
         self.chest_category='seeds'
         self.chest_page=0
-        self.hotbar_start=0
+        # Position-only layout stored locally so online host snapshots cannot overwrite it.
+        self.inventory_layout=reconcile_layout(self.settings.get('inventory_layout'), self.state)
+        self.inventory_drag_from=None
+        self.inventory_drag_start=None
+        self.active_hotbar_slot=0
         self.hud_inventory_page=0
         self.local_emote=''
         self.local_emote_until=0.
@@ -1387,7 +1393,15 @@ class Game:
                 self.persist(True);self.say('ベッドで休憩。体力が満タンになりました！')
             else:self.say('体力はすでに満タンです')
         elif action=='inventory_page':self.inventory_page=val
-        elif action=='hotbar_offset':self.hotbar_start=hotbar_offset(self.hotbar_start,val)
+        elif action=='inventory_sort':
+            self.update_inventory_layout(sort_backpack(self.current_inventory_layout()))
+            self.say('バッグを種類順に整理しました',3)
+        elif action=='inventory_activate':
+            layout=self.current_inventory_layout()
+            entry=entry_at(layout,self.state,int(val))
+            if not entry:return
+            if int(val)>=BACKPACK_SLOTS:self.active_hotbar_slot=int(val)-BACKPACK_SLOTS
+            self.do_action('inventory_pick', (entry[0],entry[1]))
         elif action=='inventory_pick':
             kind,ident=val
             if kind=='seed':self.do_action('pick_crop',ident)
@@ -1645,17 +1659,19 @@ class Game:
                 elif self.modal=='chat':
                     self.do_action('chat_scroll',event.y*2)
                 elif self.modal=='inventory':
-                    self.do_action('hotbar_offset', -event.y)
+                    pass  # Inventory slots are freely arranged; no fixed seed pages.
                 elif self.scene=='world' and self.modal is None:
                     if 1080<=px<=1279 and 382<=py<=609:
                         self.hud_inventory_page=max(0,self.hud_inventory_page-event.y)
-                    elif 310<=px<=934 and py>=650:
-                        self.do_action('hotbar_offset', -event.y)
+                    elif 310<=px<=969 and py>=650:
+                        self.active_hotbar_slot=(self.active_hotbar_slot-event.y)%9
+                        self.do_action('inventory_activate',BACKPACK_SLOTS+self.active_hotbar_slot)
             elif event.type==pygame.KEYUP:
                 self.held_keys.discard(event.key)
             elif event.type==getattr(pygame, 'WINDOWFOCUSLOST', -999):
                 self.held_keys.clear()
                 self.ime_composing=False
+                self.inventory_drag_from=None
             elif event.type==pygame.TEXTEDITING and self.modal=='chat':
                 self.chat_composition=event.text
                 self.chat_ime_cursor=event.start
@@ -1770,10 +1786,38 @@ class Game:
                         idx=next(i for i,c in enumerate(CROPS) if c.id==self.selected)
                         self.do_action('pick_crop',CROPS[(idx+1)%len(CROPS)].id)
                     elif pygame.K_1<=event.key<=pygame.K_9:
-                        idx=self.hotbar_start+event.key-pygame.K_1
-                        if idx<len(CROPS):self.do_action('pick_crop',CROPS[idx].id)
+                        self.do_action('inventory_activate', BACKPACK_SLOTS+event.key-pygame.K_1)
+            elif event.type==pygame.MOUSEBUTTONUP and event.button==1:
+                if self.inventory_drag_from is not None:
+                    source=self.inventory_drag_from
+                    target=self.backpack_slot_at(self.point(event.pos)) if self.modal=='inventory' else None
+                    self.inventory_drag_from=None
+                    self.inventory_drag_start=None
+                    if target is not None:
+                        if target==source:
+                            self.do_action('inventory_activate',source)
+                        else:
+                            updated,ok=move_or_swap(self.current_inventory_layout(),source,target)
+                            if ok:self.update_inventory_layout(updated)
+                    continue
+            elif event.type==pygame.MOUSEBUTTONDOWN and event.button==3 and self.modal=='inventory':
+                index=self.backpack_slot_at(self.point(event.pos))
+                if index is not None:
+                    updated,ok=split_stack(self.current_inventory_layout(),index)
+                    if ok:self.update_inventory_layout(updated)
+                    else:self.say('2個以上あるアイテムを右クリックすると半分に分割できます',4)
             elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
                 self.mouse=self.point(event.pos)
+                if self.modal=='inventory':
+                    index=self.backpack_slot_at(self.mouse)
+                    if index is not None:
+                        if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                            updated,ok=quick_transfer(self.current_inventory_layout(),index)
+                            if ok:self.update_inventory_layout(updated)
+                        else:
+                            self.inventory_drag_from=index if self.current_inventory_layout()[index] else None
+                            self.inventory_drag_start=self.mouse
+                        continue
                 for action,rect,val in reversed(self.buttons):
                     if rect.collidepoint(self.mouse):
                         self.do_action(action,val)
@@ -2059,18 +2103,19 @@ class Game:
         prev_xp=50*(level-1)*level if level>1 else 0
         text(s,self.fonts,f'Lv.{level}',(208,12),17,GOLD_LIGHT,True)
         bar(s,pygame.Rect(207,46,100,9),(xp-prev_xp)/max(1,next_xp-prev_xp),GREEN_LIGHT,GOLD)
-        # Persistent 9-slot seed hotbar, aligned within the existing bottom 74px strip.
-        for i,c in enumerate(inventory_hotbar(self.hotbar_start)):
+        # The HUD shares the same real nine hotbar slots as the backpack modal.
+        layout=self.current_inventory_layout()
+        for i in range(9):
             x=323+i*72;y=655
-            is_selected=c.id==self.selected
-            box(s,(x,y,65,58),GOLD_LIGHT if is_selected else CREAM,
-                GOLD if is_selected else (94,78,51),4,2)
-            self.assets.draw_crop(s,c.id,(x+8,y+4,41,42))
+            entry=entry_at(layout,self.state,BACKPACK_SLOTS+i)
+            active=i==self.active_hotbar_slot
+            box(s,(x,y,65,58),GOLD_LIGHT if active else CREAM,
+                GOLD if active else (94,78,51),4,2)
+            if entry:
+                self.draw_inventory_icon(entry,x+10,y+6,42,40)
+                text(s,self.fonts,str(entry[3]),(x+58,y+41),13,BROWN,True,True)
             text(s,self.fonts,str(i+1),(x+2,y+1),12,BROWN,True)
-            text(s,self.fonts,str(self.state['seeds'].get(c.id,0)),(x+58,y+41),14,BROWN,True,True)
-            self.register('pick_crop',(x,y,65,58),c.id)
-        self.ui_button((299,663,22,42),'‹','hotbar_offset',-1,size=15)
-        self.ui_button((971,663,22,42),'›','hotbar_offset',1,size=15)
+            self.register('inventory_activate',(x,y,65,58),BACKPACK_SLOTS+i)
         mail_num=unread_mail_count(self.state,self.mail_items)
         notice_num=unread_count(self.notice_feed,self.notice_seen)
         daily=board_rows(self.state)
@@ -2088,7 +2133,7 @@ class Game:
         show_inventory=(self.settings.get('hud_inventory_visible',True) if self.online_client
                         else self.state.get('hud_inventory_visible',True))
         if show_inventory:
-            items=[entry for entry in inventory_slots(self.state) if entry]
+            items=owned_entries(self.state)
             page_count=max(1,(len(items)+5)//6)
             self.hud_inventory_page=min(self.hud_inventory_page,page_count-1)
             box(s,(1073,389,199,215),(31,49,37),GOLD,5,2)
@@ -2375,67 +2420,101 @@ class Game:
         text(self.stage,self.fonts,f'合計収穫 {self.state["harvest_total"]} 個  /  合計出荷 {self.state["stats"]["shipped"]} 個',
              (218,644),17,BROWN,True)
 
+    def current_inventory_layout(self):
+        # Reconciliation is entirely client-side: never adjust the authoritative stock.
+        self.inventory_layout=reconcile_layout(self.inventory_layout,self.state)
+        return self.inventory_layout
+
+    def update_inventory_layout(self, updated):
+        self.inventory_layout=reconcile_layout(updated,self.state)
+        self.settings['inventory_layout']=self.inventory_layout
+        if not store_settings(self.settings):
+            self.say('並び順を保存できません。設定ファイルを確認してください。',6)
+
+    @staticmethod
+    def backpack_slot_at(point):
+        px,py=point
+        for idx in range(BACKPACK_SLOTS):
+            x=240+(idx%9)*90;y=175+(idx//9)*78
+            if x<=px<x+82 and y<=py<y+69:return idx
+        for idx in range(9):
+            x=286+idx*77;y=565
+            if x<=px<x+66 and y<=py<y+58:return BACKPACK_SLOTS+idx
+        return None
+
+    def draw_inventory_icon(self, entry, x, y, width=48, height=43):
+        if not entry:return
+        kind,ident,_,count=entry
+        if kind in ('seed','crop'):
+            self.assets.draw_crop(self.stage,ident,(x,y,width,height))
+            if kind=='seed':
+                box(self.stage,(x,y,16,15),(73,113,62),None,2)
+                text(self.stage,self.fonts,'S',(x+4,y-1),11,WHITE,True)
+        elif kind=='fish':
+            fish=FISH_BY_ID[ident]
+            cx=x+width//2;cy=y+height//2
+            pygame.draw.ellipse(self.stage,fish.color,(x+5,cy-11,width-11,23))
+            pygame.draw.polygon(self.stage,fish.color,[(x+8,cy),(x,cy-12),(x,cy+12)])
+            pygame.draw.circle(self.stage,INK,(cx+9,cy-5),2)
+        elif kind=='item':
+            box(self.stage,(x+6,y+3,max(20,width-12),max(20,height-6)),(210,141,84),BROWN,4,2)
+            text(self.stage,self.fonts,'♥',(x+width//2,y+height//2-15),24,WHITE,True,True)
+        else:
+            cx=x+width//2;cy=y+height//2
+            pygame.draw.circle(self.stage,GOLD,(cx,cy),min(width,height)//2-4)
+            text(self.stage,self.fonts,'★',(cx,cy-13),23,BROWN,True,True)
+
     def draw_inventory(self):
-        self.overlay_panel('持ち物 / BACKPACK','9×4スロットに所持品をまとめました。クリックで種選択・回復アイテム使用。')
-        items=inventory_slots(self.state)
+        self.overlay_panel('持ち物 / BACKPACK', 'ドラッグ: 移動・交換  /  Shift+クリック: ホットバーへ  /  右クリック: 半分に分割')
+        layout=self.current_inventory_layout()
         mouse=self.mouse
         hovered=None
-        # Dark slot outlines and item counters match a Minecraft-style backpack.
-        for idx,entry in enumerate(items):
+        for idx in range(BACKPACK_SLOTS):
             col,row=idx%9,idx//9
             x,y=240+col*90,175+row*78
             rect=pygame.Rect(x,y,82,69)
-            selected=(entry is not None and entry[0]=='seed' and entry[1]==self.selected)
-            box(self.stage,rect,(90,94,73) if not selected else (105,143,72),
-                GOLD_LIGHT if selected else (54,66,49),4,3)
+            entry=entry_at(layout,self.state,idx)
+            active=self.inventory_drag_from==idx
+            box(self.stage,rect,(110,147,88) if active else (90,94,73),
+                GOLD_LIGHT if active else (54,66,49),4,3)
             box(self.stage,(x+5,y+5,72,59),(223,220,184),None,3)
             if entry:
-                kind,ident,label,count=entry
-                if kind in ('seed','crop'):
-                    self.assets.draw_crop(self.stage,ident,(x+12,y+5,57,51))
-                    if kind=='seed':
-                        box(self.stage,(x+7,y+6,20,18),(73,113,62),None,2)
-                        text(self.stage,self.fonts,'S',(x+12,y+7),12,WHITE,True)
-                elif kind=='fish':
-                    fish=FISH_BY_ID[ident]
-                    pygame.draw.ellipse(self.stage,fish.color,(x+19,y+18,47,27))
-                    pygame.draw.polygon(self.stage,fish.color,[(x+21,y+32),(x+9,y+20),(x+9,y+45)])
-                    pygame.draw.circle(self.stage,INK,(x+51,y+27),3)
-                elif kind=='item':
-                    box(self.stage,(x+21,y+13,44,44),(210,141,84),BROWN,5,2)
-                    text(self.stage,self.fonts,'♥',(x+28,y+17),25,WHITE,True)
-                else:
-                    pygame.draw.circle(self.stage,GOLD,(x+43,y+33),23)
-                    pygame.draw.circle(self.stage,BROWN,(x+43,y+33),23,3)
-                    text(self.stage,self.fonts,'★',(x+29,y+17),25,BROWN,True)
-                count_text=str(count)
-                text(self.stage,self.fonts,count_text,(x+70,y+58),17,INK,True,True)
-                self.register('inventory_pick',rect,(kind,ident))
+                self.draw_inventory_icon(entry,x+13,y+6,55,45)
+                text(self.stage,self.fonts,str(entry[3]),(x+73,y+54),16,INK,True,True)
                 if rect.collidepoint(mouse):hovered=entry
             else:
                 pygame.draw.rect(self.stage,(165,159,133),(x+13,y+10,58,47),1)
+        # Slot 36..44 is the actual customizable hotbar, not an independent seed catalog.
         box(self.stage,(232,529,817,120),(86,96,75),BROWN,6,3)
-        text(self.stage,self.fonts,'ホットバー   [1～9] クリックでも選択', (249,539),16,PALE,True)
-        for i,c in enumerate(inventory_hotbar(self.hotbar_start)):
+        text(self.stage,self.fonts,'ホットバー   [1～9]  ドラッグで好きなアイテムを登録',(249,539),16,PALE,True)
+        for i in range(9):
+            idx=BACKPACK_SLOTS+i
             x=286+i*77;y=565
-            selected=self.selected==c.id
-            box(self.stage,(x,y,66,58),GOLD_LIGHT if selected else CREAM,
-                GOLD if selected else BROWN,4,2)
-            self.assets.draw_crop(self.stage,c.id,(x+5,y+3,44,44))
-            text(self.stage,self.fonts,str(i+1),(x+3,y+3),12,BROWN,True)
-            text(self.stage,self.fonts,str(self.state['seeds'][c.id]),(x+57,y+48),15,BROWN,True,True)
-            self.register('pick_crop',(x,y,66,58),c.id)
-        self.ui_button((248,584,29,34),'◀','hotbar_offset',-1,disabled=self.hotbar_start==0,size=15)
-        self.ui_button((991,584,29,34),'▶','hotbar_offset',1,disabled=self.hotbar_start>0,size=15)
+            entry=entry_at(layout,self.state,idx)
+            active=self.active_hotbar_slot==i
+            box(self.stage,(x,y,66,58),GOLD_LIGHT if active else CREAM,
+                GOLD if active else BROWN,4,2)
+            if entry:
+                self.draw_inventory_icon(entry,x+9,y+6,42,38)
+                text(self.stage,self.fonts,str(entry[3]),(x+59,y+44),14,BROWN,True,True)
+                if pygame.Rect(x,y,66,58).collidepoint(mouse):hovered=entry
+            text(self.stage,self.fonts,str(i+1),(x+2,y+1),12,BROWN,True)
+        self.ui_button((879,142,147,29),'自動整理','inventory_sort',size=14)
         if hovered:
             kind,ident,label,count=hovered
-            action=('クリック：種を装備' if kind=='seed' else 'クリック：使用' if kind=='item'
-                    else 'イベント交換所で使用' if kind=='token' else '出荷所・魚市場で販売')
+            operation=('クリックで種を選択' if kind=='seed' else 'クリックで使用' if kind=='item'
+                       else 'イベント交換所で使用' if kind=='token' else '出荷所・魚市場で販売')
             box(self.stage,(238,491,800,32),WHITE,BROWN,3,1)
-            text(self.stage,self.fonts,f'{label}  ×{count}   /   {action}',(248,496),17,INK,True,max_width=765)
+            text(self.stage,self.fonts,f'{label} ×{count}  /  {operation}',(248,496),16,INK,True,max_width=765)
         else:
-            text(self.stage,self.fonts,'所持数が1個以上のアイテムを表示します。空のスロットは未所持です。',
-                 (247,498),15,BROWN)
+            text(self.stage,self.fonts,'並び順は自動保存。所持品の数は変わりません。右クリックでスタックを半分に分けます。',
+                 (247,498),14,BROWN)
+        if self.inventory_drag_from is not None:
+            entry=entry_at(layout,self.state,self.inventory_drag_from)
+            if entry:
+                x,y=self.mouse
+                box(self.stage,(int(x)-19,int(y)-18,66,58),PAPER,GOLD,3,2)
+                self.draw_inventory_icon(entry,int(x)-11,int(y)-12,39,38)
 
     def draw_missions(self):
         self.overlay_panel('ミッション  /  QUEST BOARD','畑と釣りの両方に挑戦しよう。条件を満たすと報酬を受け取れます。')
@@ -3165,8 +3244,8 @@ class Game:
         self.overlay_panel('遊び方・データ管理','マップと各施設は今回の新規仮実装です。元デザインを再現したものではありません。')
         lines=[
             'WASD / 矢印：歩く　　E / Space：調べる・植える・収穫する',
-            'I / Tab：種と倉庫　 M：ミッション　 F9：緊急脱出　 T：チャット（オンライン）',
-            'Q / R：選択する種を変更（インベントリからも選択可）',
+            'I / Tab：持ち物・並べ替え　 M：ミッション　 F9：緊急脱出　 T：チャット',
+            'バッグ：ドラッグで交換、Shift+クリックでホットバー移動、右クリックで半分に分割',
             'たね屋：右上の建物。近くでEを押すと種を購入できます。',
             '出荷所：右下の建物。収穫した作物を出荷してGを獲得。',
             '掲示板：マップ中央。ミッションを進めて報酬を獲得。',
