@@ -168,7 +168,9 @@ def validate_state(raw):
                   'outfit_draft','friends','player_uid','friend_ids','local_chat','player_name','mail_claimed',
                   'event_tokens','event_claimed','event_earned_on','event_daily_count',
                   'farm_xp','farm_level','farm_stat_seen','daily_board','profile_bio','profile_title',
-                  'profile_cache','arena_record','goal_effect','home_chest'):
+                  'profile_cache','arena_record','goal_effect','home_chest',
+                  'login_reward','favorite_crop','home_decor','home_decor_selected',
+                  'quick_quest_visible','hud_inventory_visible'):
         if field in raw:
             initial[field]=raw[field]
     try:

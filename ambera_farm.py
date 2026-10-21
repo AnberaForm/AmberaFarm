@@ -50,6 +50,8 @@ from notices import (load_offline, fetch_public, load_seen, mark_seen,
 from farm_mailbox import load as load_public_mail, fetch as fetch_public_mail
 from inventory_grid import slots as inventory_slots, hotbar as inventory_hotbar, hotbar_offset
 from town_features import (init_town, move_chest, rest_in_bed, STORAGE_IDS, STORAGE_NAMES)
+from life_hub import (DECOR, EMOTES, login_reward_view, claim_login_reward, craft_decor,
+                      set_decor, claim_all_mail, unread_mail_count)
 from coop_orders import new_board, view as coop_board_view
 from kabuball_core import KabuballMatch, LEFT, TOP, RIGHT, BOTTOM
 from profile_progress import (init_profile, refresh_progress, board_rows, claim_daily,
@@ -313,7 +315,8 @@ def settings_file():
 
 
 def load_settings():
-    initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False, 'fps_limit': 60}
+    initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False, 'fps_limit': 60,
+               'hud_inventory_visible': True, 'quick_quest_visible': True}
     try:
         data = json.loads(settings_file().read_text(encoding='utf-8-sig'))
         if isinstance(data, dict):
@@ -404,7 +407,7 @@ class Game:
         pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=1024)
         pygame.init()
         pygame.font.init()
-        pygame.display.set_caption('アンベラ牧場 - v9.0 町と集会所の再開発')
+        pygame.display.set_caption('アンベラ牧場 - v9.1 牧場生活アップデート')
         self.settings = load_settings()
         self.screen = None
         self.stage = pygame.Surface((BASE_W, BASE_H)).convert() if pygame.display.get_surface() else pygame.Surface((BASE_W, BASE_H))
@@ -437,6 +440,10 @@ class Game:
         self.chest_category='seeds'
         self.chest_page=0
         self.hotbar_start=0
+        self.hud_inventory_page=0
+        self.local_emote=''
+        self.local_emote_until=0.
+        self.lobby_gift_item='tea'
         self.inventory_hover=None
         self.notice_zoom=False
         self.chat_price_info=False
@@ -500,6 +507,7 @@ class Game:
         self.offline_state = None
         self.remote_players = []
         self.friend_invites=[]
+        self.party_state={'members':[],'invite':None}
         self.room_pin = ''
         self.last_network_pos = 0
         self.remote_targets = {}
@@ -818,11 +826,16 @@ class Game:
             targets[pid] = (x, y)
             if pid not in known:
                 known[pid] = dict(player)
+                known[pid]['emote_local_until']=time.monotonic()+3.5 if player.get('emote') else 0.
             else:
                 known[pid]['name'] = player.get('name', known[pid].get('name', 'Player'))
                 known[pid]['uid'] = player.get('uid', known[pid].get('uid', ''))
                 if isinstance(player.get('public_profile'),dict):
                     known[pid]['public_profile']=player['public_profile']
+                if known[pid].get('emote_seq') != player.get('emote_seq'):
+                    known[pid]['emote']=player.get('emote','')
+                    known[pid]['emote_seq']=player.get('emote_seq')
+                    known[pid]['emote_local_until']=time.monotonic()+3.5
         self.remote_targets = targets
         self.remote_players = [known[pid] for pid in targets]
 
@@ -903,6 +916,7 @@ class Game:
                         self.modal='arena_match'
                     self.coop_board=packet.get('coop_board',self.coop_board)
                     self.friend_invites=packet.get('friend_invites',[])
+                    self.party_state=packet.get('party',self.party_state)
                     self.update_remote_positions(packet.get('players', []))
                     self.sync_position(packet.get('self_pos'), packet.get('move_seq'),
                                        packet.get('move_step_seq'))
@@ -934,6 +948,7 @@ class Game:
                     self.modal='arena_match'
                 self.coop_board=packet.get('coop_board',self.coop_board)
                 self.friend_invites=packet.get('friend_invites',self.friend_invites)
+                self.party_state=packet.get('party',self.party_state)
                 if isinstance(packet.get('state'), dict):
                     incoming = packet['state']
                     incoming['selected_crop'] = self.selected
@@ -1232,7 +1247,58 @@ class Game:
         if self.online_client and action in ('buy','ship','fish_sell','claim'):
             self.online_client.action(action,list(val) if isinstance(val,tuple) else val)
             return
-        if action=='profile':self.profile_view_uid=None;self.modal='profile'
+        if action=='notification_open':self.do_action(val,None)
+        elif action=='login_bonus':self.modal='login_bonus'
+        elif action=='login_claim':
+            if self.online_client:self.online_client.action('login_claim',None)
+            elif claim_login_reward(self.state):self.persist(True);self.say('ログインボーナスを受け取りました！')
+            else:self.say('本日の報酬は受取済みです')
+        elif action=='notifications':self.modal='notifications'
+        elif action=='mail_claim_all':
+            if self.online_client:self.online_client.action('mail_claim_all',None)
+            else:
+                number=claim_all_mail(self.state,self.mail_items)
+                if number:self.persist(True)
+                self.say(f'{number}件のプレゼントを受け取りました')
+        elif action=='profile_favorite':
+            if val in CROP_BY_ID:
+                if self.online_client:self.online_client.action('profile_favorite',val)
+                else:self.state['favorite_crop']=val;self.persist(True)
+        elif action=='decor':self.modal='decor'
+        elif action=='decor_craft':
+            if self.online_client:self.online_client.action('decor_craft',val)
+            elif craft_decor(self.state,val):self.persist(True);self.say('新しい家具を作りました！')
+            else:self.say('必要な作物が足りないか作成済みです')
+        elif action=='decor_equip':
+            if self.online_client:self.online_client.action('decor_equip',val)
+            elif set_decor(self.state,val):self.persist(True);self.say('家具を配置しました！')
+        elif action=='social':self.modal='social'
+        elif action=='social_emote':
+            if val in EMOTES:
+                if self.online_client:self.online_client.action('emote',val)
+                self.local_emote=val;self.local_emote_until=time.monotonic()+3.5
+        elif action=='social_gift_item':
+            if val in ('tea','riceball','lunch'):self.lobby_gift_item=val
+        elif action=='social_gift':
+            if self.online_client:self.online_client.action('gift_item',{'target':val,'item':self.lobby_gift_item,'count':1})
+            else:self.say('プレゼントはオンラインのフレンドに送れます')
+        elif action in ('party_invite','party_accept','party_leave'):
+            if self.online_client:self.online_client.action(action,val)
+            else:self.say('パーティ機能はオンライン限定です')
+        elif action=='social_party_ping':
+            if self.online_client:self.online_client.chat('一緒に依頼をやろう！ 集会所で待ってるよ！')
+            else:self.say('オンラインの部屋に入ると合流できます')
+        elif action=='hud_inventory_page':self.hud_inventory_page=max(0,self.hud_inventory_page+int(val))
+        elif action=='hud_toggle':
+            key=val
+            if key in ('hud_inventory_visible','quick_quest_visible'):
+                if self.online_client:
+                    # Pure UI preference is local-only while online; never mutate authoritative wallet.
+                    self.settings[key]=not self.settings.get(key,True);store_settings(self.settings)
+                else:
+                    self.state[key]=not self.state[key];self.persist(True)
+        elif action=='hud_settings':self.modal='hud_settings'
+        elif action=='profile':self.profile_view_uid=None;self.modal='profile'
         elif action=='friend_profile':self.profile_view_uid=val;self.modal='profile'
         elif action=='profile_edit':
             self.bio_draft=self.state.get('profile_bio','')
@@ -1580,6 +1646,11 @@ class Game:
                     self.do_action('chat_scroll',event.y*2)
                 elif self.modal=='inventory':
                     self.do_action('hotbar_offset', -event.y)
+                elif self.scene=='world' and self.modal is None:
+                    if 1080<=px<=1279 and 382<=py<=609:
+                        self.hud_inventory_page=max(0,self.hud_inventory_page-event.y)
+                    elif 310<=px<=934 and py>=650:
+                        self.do_action('hotbar_offset', -event.y)
             elif event.type==pygame.KEYUP:
                 self.held_keys.discard(event.key)
             elif event.type==getattr(pygame, 'WINDOWFOCUSLOST', -999):
@@ -1689,6 +1760,9 @@ class Game:
                     elif event.key==pygame.K_p:self.do_action('profile',None)
                     elif event.key==pygame.K_c:self.modal='costume'
                     elif event.key==pygame.K_b:self.modal='event'
+                    elif event.key==pygame.K_n:self.modal='notifications'
+                    elif event.key==pygame.K_l:self.modal='login_bonus'
+                    elif event.key==pygame.K_v:self.modal='social'
                     elif event.key==pygame.K_q:
                         idx=next(i for i,c in enumerate(CROPS) if c.id==self.selected)
                         self.do_action('pick_crop',CROPS[(idx-1)%len(CROPS)].id)
@@ -1900,6 +1974,9 @@ class Game:
                 pygame.draw.rect(w,(231,187,145),(rx-8,ry-16,16,18))
                 pygame.draw.rect(w,(77,63,52),(rx-11,ry-20,22,6))
                 text(w,self.fonts,person['name'],(rx,ry-43),15,WHITE,True,True)
+                if person.get('emote') in EMOTES and time.monotonic()<person.get('emote_local_until',0):
+                    box(w,(rx-56,ry-80,112,28),CREAM,BROWN,4,1)
+                    text(w,self.fonts,EMOTES[person['emote']],(rx,ry-76),14,BROWN,True,True)
 
         for tx,ty in self.tree_positions:
             x=int(tx*TILE-cx);y=int(ty*TILE-cy)
@@ -1966,9 +2043,212 @@ class Game:
             else:
                 labels={'shop':'たね屋の内装へ','shipping':'出荷所の内装へ','missions':'ミッションを見る','home':'自宅へ入る','fishing':'釣りを始める','fish_market':'魚市場の内装へ','general_store':'道具・雑貨屋へ','hall':'集会所へ','workshop':'衣装工房へ','cafe':'カフェへ','greenhouse':'温室へ','travel':'馬車で移動する','fisherman':'ナギと話す','guide':'ミオと話す','merchant':'店主と話す'}
                 msg=('E  '+labels[action]) if action in labels else 'WASD 移動 | F9 脱出 | E 調べる | I 持ち物 | G 協力出荷 | T チャット | Esc メニュー'
-        text(s,self.fonts,msg,(22,VIEW_TOP+VIEW_HEIGHT+18),18,CREAM,True,max_width=1040)
+        text(s,self.fonts,msg,(18,VIEW_TOP+VIEW_HEIGHT+19),15,CREAM,True,max_width=275)
+        if self.message and time.monotonic()<self.message_until:
+            box(s,(329,79,616,43),DARK_2,GOLD,6,2)
+            text(s,self.fonts,self.message,(346,90),17,WHITE,True,max_width=581)
         self.ui_button((1094,VIEW_TOP+VIEW_HEIGHT+12,165,42),'メニュー','overlay','pause',size=18)
         self.draw_minimap()
+        self.draw_life_hud()
+
+    def draw_life_hud(self):
+        """Read-only world overlay. All spending routes through existing actions."""
+        s=self.stage
+        xp=int(self.state.get('farm_xp',0));level=int(self.state.get('farm_level',1))
+        next_xp=50*level*(level+1)
+        prev_xp=50*(level-1)*level if level>1 else 0
+        text(s,self.fonts,f'Lv.{level}',(208,12),17,GOLD_LIGHT,True)
+        bar(s,pygame.Rect(207,46,100,9),(xp-prev_xp)/max(1,next_xp-prev_xp),GREEN_LIGHT,GOLD)
+        # Persistent 9-slot seed hotbar, aligned within the existing bottom 74px strip.
+        for i,c in enumerate(inventory_hotbar(self.hotbar_start)):
+            x=323+i*72;y=655
+            is_selected=c.id==self.selected
+            box(s,(x,y,65,58),GOLD_LIGHT if is_selected else CREAM,
+                GOLD if is_selected else (94,78,51),4,2)
+            self.assets.draw_crop(s,c.id,(x+8,y+4,41,42))
+            text(s,self.fonts,str(i+1),(x+2,y+1),12,BROWN,True)
+            text(s,self.fonts,str(self.state['seeds'].get(c.id,0)),(x+58,y+41),14,BROWN,True,True)
+            self.register('pick_crop',(x,y,65,58),c.id)
+        self.ui_button((299,663,22,42),'‹','hotbar_offset',-1,size=15)
+        self.ui_button((971,663,22,42),'›','hotbar_offset',1,size=15)
+        mail_num=unread_mail_count(self.state,self.mail_items)
+        notice_num=unread_count(self.notice_feed,self.notice_seen)
+        daily=board_rows(self.state)
+        ready=sum(1 for q in daily if q['progress']>=q['target'] and not q['claimed'])
+        widgets=(('お知らせ'+(' ●' if notice_num else ''),'notices'),
+                 ('メール'+(f' {mail_num}' if mail_num else ''),'mail'),
+                 ('依頼'+(f' {ready}' if ready else ''),'daily_board'),
+                 ('ボーナス'+(' ●' if not login_reward_view(self.state)['claimed'] else ''),'login_bonus'),
+                 ('交流','social'),('イベント','event'))
+        for i,(label,action) in enumerate(widgets):
+            x=1073+(i%2)*97;y=258+(i//2)*42
+            self.ui_button((x,y,92,36),label,action,size=12)
+        self.ui_button((1075,611,93,34),'バッグ I','overlay','inventory',size=13)
+        self.ui_button((1174,611,93,34),'UI設定','hud_settings',size=12)
+        show_inventory=(self.settings.get('hud_inventory_visible',True) if self.online_client
+                        else self.state.get('hud_inventory_visible',True))
+        if show_inventory:
+            items=[entry for entry in inventory_slots(self.state) if entry]
+            page_count=max(1,(len(items)+5)//6)
+            self.hud_inventory_page=min(self.hud_inventory_page,page_count-1)
+            box(s,(1073,389,199,215),(31,49,37),GOLD,5,2)
+            text(s,self.fonts,f'持ち物 {len(items)}種類',(1082,394),15,CREAM,True)
+            for j,entry in enumerate(items[self.hud_inventory_page*6:self.hud_inventory_page*6+6]):
+                kind,ident,label,count=entry;x=1081+(j%2)*97;y=419+(j//2)*55
+                box(s,(x,y,90,50),CREAM,BROWN,4,2)
+                if kind in ('seed','crop'):
+                    self.assets.draw_crop(s,ident,(x+3,y+5,37,35))
+                elif kind=='fish':
+                    pygame.draw.ellipse(s,FISH_BY_ID[ident].color,(x+6,y+15,35,19))
+                else:
+                    text(s,self.fonts,'♥' if kind=='item' else '★',(x+10,y+8),22,RED,True)
+                text(s,self.fonts,str(count),(x+84,y+30),15,BROWN,True,True)
+                text(s,self.fonts,label,(x+3,y+40),10,BROWN,max_width=82)
+            text(s,self.fonts,f'{self.hud_inventory_page+1}/{page_count}  ホイールで切替',
+                 (1084,590),11,CREAM)
+        show_quests=(self.settings.get('quick_quest_visible',True) if self.online_client
+                     else self.state.get('quick_quest_visible',True))
+        if show_quests:
+            box(s,(13,164,195,138),(31,49,37),GOLD,5,2)
+            text(s,self.fonts,'今日の依頼  M',(22,172),17,CREAM,True)
+            for i,q in enumerate(daily[:2]):
+                color=GOLD_LIGHT if q['progress']>=q['target'] and not q['claimed'] else CREAM
+                text(s,self.fonts,q['name'],(21,210+i*42),14,color,max_width=180)
+                text(s,self.fonts,f'{q["progress"]}/{q["target"]}'+(' 受取可' if q['progress']>=q['target'] and not q['claimed'] else ''),
+                     (25,230+i*42),12,color)
+            self.register('daily_board',(13,164,195,138))
+        if self.local_emote and time.monotonic()<self.local_emote_until:
+            px=int(self.player[0]-self.camera[0]);py=int(self.player[1]-self.camera[1])+VIEW_TOP
+            if 0<px<BASE_W and VIEW_TOP<py<VIEW_TOP+VIEW_HEIGHT:
+                box(s,(max(0,px-57),py-78,114,29),PALE,BROWN,6,2)
+                text(s,self.fonts,EMOTES.get(self.local_emote,''),(max(0,px-53),py-73),16,BROWN,True,max_width=106)
+
+    def draw_login_bonus(self):
+        reward=login_reward_view(self.state)
+        self.overlay_panel('ログインボーナス / DAILY GIFT','毎日1回プレゼントを受け取れます。Gはゲーム内だけで使用できます。')
+        for i,g in enumerate((10,15,20,25,30,40,75)):
+            x=246+(i%4)*200;y=186+(i//4)*153
+            box(self.stage,(x,y,180,133),GOLD_LIGHT if i+1==reward['day'] else CREAM,BROWN,8,3)
+            text(self.stage,self.fonts,f'{i+1}日目',(x+13,y+8),19,BROWN,True)
+            text(self.stage,self.fonts,f'{g} G',(x+25,y+47),27,GREEN_DARK,True)
+            if i==6:text(self.stage,self.fonts,'+ 種2個',(x+25,y+87),14,RED,True)
+        status='今日の報酬は受取済み！' if reward['claimed'] else f'今日の報酬：{reward["coins"]}G'
+        text(self.stage,self.fonts,status,(640,514),22,BROWN,True,True)
+        self.ui_button((440,557,402,63),'受取済み' if reward['claimed'] else '本日の報酬を受け取る',
+                       'login_claim',disabled=reward['claimed'],size=21)
+        text(self.stage,self.fonts,'※7日で1周。連続ログインが途切れると1日目へ戻ります。',
+             (640,643),14,GREEN_DARK,False,True)
+
+    def draw_notifications(self):
+        self.overlay_panel('お知らせセンター / NOTIFICATIONS','未受取・未確認の情報をまとめて表示します。')
+        daily=board_rows(self.state)
+        entries=[('公式お知らせ','未読 '+str(unread_count(self.notice_feed,self.notice_seen))+'件','notices'),
+                 ('プレゼントBOX', '未受取 '+str(unread_mail_count(self.state,self.mail_items))+'件','mail'),
+                 ('村の依頼','報酬受取可能 '+str(sum(q['progress']>=q['target'] and not q['claimed'] for q in daily))+'件','daily_board'),
+                 ('ログインボーナス','本日受取済み' if login_reward_view(self.state)['claimed'] else '本日分が受取可能','login_bonus'),
+                 ('季節イベント',active_event()['name'] if active_event() else '開催待ち','event'),
+                 ('フレンド','申請 '+str(len(self.friend_invites))+'件','friends')]
+        for i,(label,detail,action) in enumerate(entries):
+            x=244+(i%2)*401;y=184+(i//2)*132
+            box(self.stage,(x,y,378,113),CREAM,BROWN,6,2)
+            text(self.stage,self.fonts,label,(x+16,y+12),21,BROWN,True)
+            text(self.stage,self.fonts,detail,(x+16,y+47),16,GREEN_DARK)
+            self.ui_button((x+233,y+62,130,39),'開く','notification_open',action,size=16)
+
+    def draw_home_furniture(self):
+        key=self.state.get('home_decor_selected','plant')
+        if key=='plant':
+            pygame.draw.rect(self.stage,(150,94,64),(839,365,62,46))
+            pygame.draw.ellipse(self.stage,(83,160,79),(825,331,94,45))
+        elif key=='rug':
+            pygame.draw.ellipse(self.stage,(117,160,95),(804,374,122,55))
+            pygame.draw.ellipse(self.stage,(219,188,109),(822,390,87,22))
+        elif key=='table':
+            pygame.draw.rect(self.stage,(102,66,46),(841,379,80,51))
+            pygame.draw.rect(self.stage,(183,120,71),(826,359,107,20))
+        elif key=='lamp':
+            pygame.draw.rect(self.stage,(79,64,45),(857,366,16,68))
+            pygame.draw.circle(self.stage,(247,226,123),(863,345),30)
+
+    def draw_decor(self):
+        self.overlay_panel('自宅の模様替え / HOME DESIGN','収穫した作物で家具を作ろう。作った家具は自宅に飾れます。')
+        for i,(key,(label,needs,description)) in enumerate(DECOR.items()):
+            x=252+(i%2)*401;y=181+(i//2)*192
+            box(self.stage,(x,y,377,171),CREAM,BROWN,5,2)
+            text(self.stage,self.fonts,label,(x+15,y+12),22,BROWN,True)
+            text(self.stage,self.fonts,description,(x+15,y+47),15,INK,max_width=350)
+            materials=' / '.join(CROP_BY_ID[k].name+f'{v}個' for k,v in needs.items())
+            text(self.stage,self.fonts,'材料: '+materials,(x+15,y+78),14,GREEN_DARK,max_width=345)
+            owned=key in self.state['home_decor'];equipped=key==self.state['home_decor_selected']
+            label='飾っている' if equipped else '配置する' if owned else '家具を作る'
+            action='decor_equip' if owned else 'decor_craft'
+            allowed=owned or all(self.state['warehouse'].get(k,0)>=v for k,v in needs.items())
+            self.ui_button((x+100,y+113,186,42),label,action,key,disabled=equipped or not allowed,size=17)
+        text(self.stage,self.fonts,'家具は外見のみ変更。作物・アイテムの保管場所は変更しません。',
+             (640,631),15,GREEN_DARK,False,True)
+
+    def draw_social(self):
+        self.overlay_panel('交流広場 / SOCIAL','エモート・協力の呼びかけ・近くのフレンドへのプレゼント。')
+        for i,(key,name) in enumerate(EMOTES.items()):
+            x=265+(i%2)*377;y=173+(i//2)*61
+            self.ui_button((x,y,349,52),name,'social_emote',key,size=19)
+        self.ui_button((285,317,435,51),'協力依頼を呼びかける','social_party_ping',size=18)
+        invite=self.party_state.get('invite') if isinstance(self.party_state,dict) else None
+        if invite:self.ui_button((730,317,259,51),invite['name']+'からの招待を承認','party_accept',size=14)
+        else:self.ui_button((730,317,259,51),'パーティから退出','party_leave',
+                            disabled=not self.party_state.get('members'),size=14)
+        text(self.stage,self.fonts,'プレゼント（自分の所持品から1個）',(270,393),19,BROWN,True)
+        for i,item in enumerate(('tea','riceball','lunch')):
+            self.ui_button((278+i*238,430,216,42),ITEMS[item][0]+' '+str(self.state['consumables'].get(item,0)),
+                           'social_gift_item',item,selected=self.lobby_gift_item==item,size=17)
+        if not self.online_client or not self.remote_players:
+            text(self.stage,self.fonts,'オンラインで同じ部屋のフレンドに近づくとプレゼントできます。',
+                 (640,527),18,INK,False,True)
+        for i,p in enumerate(self.remote_players[:3]):
+            y=495+i*49
+            friend=p.get('uid') in self.state['friend_ids']
+            text(self.stage,self.fonts,p['name']+('  [フレンド]' if friend else ''),(273,y+12),16,INK,True)
+            self.ui_button((716,y,135,42),'プレゼント','social_gift',p['id'],
+                           disabled=not friend or self.state['consumables'].get(self.lobby_gift_item,0)<1,size=14)
+            self.ui_button((863,y,145,42),'招待する','party_invite',p['id'],disabled=not friend,size=14)
+        text(self.stage,self.fonts,'※G取引なし。ギフト・パーティ招待はオンラインのフレンド限定。',
+             (640,646),14,GREEN_DARK,False,True)
+
+    def draw_progression(self):
+        self.overlay_panel('育成・実績 / FARMER RECORD','農業・釣り・出荷・交流の成果を見える化。効果や報酬は既存システムに従います。')
+        stats=self.state['stats']
+        farm=self.state.get('farm_level',1)
+        fish_level=min(50,1+stats.get('fish_caught',0)//10)
+        shipped=stats.get('shipped',0)
+        ship_level='見習い' if shipped<10 else '村の出荷人' if shipped<50 else '熟練出荷人' if shipped<150 else '大商人'
+        friends=len(self.state.get('friend_ids',[]))
+        decor=len(self.state.get('home_decor',[]))
+        values=[('農場レベル',f'Lv.{farm}',f'経験値 {self.state.get("farm_xp",0)} XP'),
+                ('釣り実績',f'Lv.{fish_level}',f'釣った魚 {stats.get("fish_caught",0)}匹'),
+                ('出荷ランク',ship_level,f'累計出荷 {shipped}個'),
+                ('交流の記録',f'{friends}人とフレンド',f'同じ部屋で交流できます'),
+                ('家の改装',f'家具 {decor}/{len(DECOR)}',f'自宅で家具を作って飾れます'),
+                ('カブボール',f'{self.state["arena_record"]["wins"]}勝',
+                 f'レート {self.state["arena_record"]["rating"]}')]
+        for i,(label,value,detail) in enumerate(values):
+            x=248+(i%2)*398;y=167+(i//2)*141
+            box(self.stage,(x,y,374,121),CREAM,BROWN,5,2)
+            text(self.stage,self.fonts,label,(x+15,y+9),18,BROWN,True)
+            text(self.stage,self.fonts,value,(x+15,y+35),23,GREEN_DARK,True,max_width=336)
+            text(self.stage,self.fonts,detail,(x+15,y+85),14,INK,max_width=346)
+        self.ui_button((261,609,348,43),'村の依頼を見る','daily_board',size=17)
+        self.ui_button((661,609,348,43),'プロフィールを見る','profile',size=17)
+
+    def draw_hud_settings(self):
+        self.overlay_panel('画面カスタマイズ / HUD','常時表示を好みに合わせて切り替えられます。')
+        view=self.settings if self.online_client else self.state
+        for i,(key,label) in enumerate((('hud_inventory_visible','右側の簡易インベントリ'),
+                                        ('quick_quest_visible','左側の日替わり依頼'))):
+            self.ui_button((330,242+i*100,622,63),label+('：ON' if view.get(key,True) else '：OFF'),
+                           'hud_toggle',key,size=22)
+        text(self.stage,self.fonts,'ホットバーは常に表示。Iキーで36スロットの詳細バッグを開けます。',
+             (640,503),17,INK,False,True)
+        self.ui_button((450,565,380,50),'通知センターを開く','notifications',size=17)
 
     def draw_minimap(self):
         x,y=BASE_W-209,VIEW_TOP+14
@@ -2356,6 +2636,7 @@ class Game:
         pygame.draw.rect(self.stage,(120,79,47),(505,324,266,120))
         pygame.draw.rect(self.stage,(221,182,111),(519,335,238,95))
         if self.interior=='home':
+            self.draw_home_furniture()
             pygame.draw.rect(self.stage,(103,71,55),(290,339,180,100))
             pygame.draw.rect(self.stage,(224,232,218),(300,347,160,68))
             pygame.draw.rect(self.stage,(245,243,219),(307,352,65,36))
@@ -2391,9 +2672,10 @@ class Game:
         text(self.stage,self.fonts,{'home':'ベッド・収納箱','shop':'種の棚・レジ','shipping':'出荷用木箱・伝票','fish_market':'氷の台・魚の水槽',
                                   'general_store':'飲食物と道具の棚','hall':'大会のステージ・掲示板','greenhouse':'苗床と日替わり依頼','workshop':'衣装の生地と型紙','cafe':'休憩とフレンド交流'}[self.interior],(641,295),24,BROWN,True,True)
         if self.interior=='home':
-            self.ui_button((277,468,218,55),'収納箱を開く','chest',size=18)
-            self.ui_button((520,468,218,55),'ベッドで休憩','home_rest',size=18)
-            self.ui_button((765,468,218,55),'セーブ管理','data_menu',size=18)
+            self.ui_button((261,468,181,55),'収納箱','chest',size=18)
+            self.ui_button((449,468,181,55),'ベッド','home_rest',size=18)
+            self.ui_button((636,468,181,55),'模様替え','decor',size=18)
+            self.ui_button((826,468,181,55),'セーブ管理','data_menu',size=18)
         elif self.interior=='greenhouse':
             self.ui_button((482,472,316,58),'村の依頼掲示板','daily_board',size=21)
         elif self.interior=='workshop':
@@ -2497,6 +2779,8 @@ class Game:
         self.overlay_panel('郵便受け  /  MAIL','公式の一斉配布アイテムを受け取れます。個別プレイヤー宛メールは未対応。')
         if not self.mail_items:
             text(self.stage,self.fonts,'現在受け取れる配布メールはありません。',(640,313),24,INK,True,True)
+        self.ui_button((808,143,210,39),'まとめて受け取る','mail_claim_all',
+                       disabled=unread_mail_count(self.state,self.mail_items)==0,size=16)
         for i,m in enumerate(self.mail_items[:5]):
             y=191+i*88
             name=str(m.get('title','配布アイテム'))[:36]
@@ -2549,6 +2833,9 @@ class Game:
         text(self.stage,self.fonts,info.get('name','牧場主'),(267,186),29,BROWN,True,max_width=440)
         text(self.stage,self.fonts,title_label,(269,237),19,GREEN_DARK,True)
         text(self.stage,self.fonts,f'農場 Lv.{info.get("farm_level",1)}',(821,206),23,BROWN,True)
+        favorite=CROP_BY_ID.get(info.get('favorite_crop','kaiware'))
+        text(self.stage,self.fonts,'好きな作物：'+(favorite.name if favorite else '未設定'),
+             (812,252),15,GREEN_DARK,True)
         box(self.stage,(247,312,782,96),PALE,BROWN,5,2)
         text(self.stage,self.fonts,'自己紹介',(266,321),18,BROWN,True)
         bio=info.get('bio') or '自己紹介はまだありません。'
@@ -2565,7 +2852,11 @@ class Game:
             here=self.state.get('profile_title','farmer')
             k=(keys.index(here)+1)%len(keys) if here in keys else 0
             self.ui_button((616,505,380,51),'称号変更 → '+TITLE_LABELS[keys[k]],'profile_title',keys[k],size=16)
-            self.ui_button((264,575,350,50),'村の依頼と農場レベル','daily_board',size=17)
+            favorites=list(CROP_BY_ID)
+            current=self.state.get('favorite_crop','kaiware')
+            following=favorites[(favorites.index(current)+1)%len(favorites)] if current in favorites else favorites[0]
+            self.ui_button((264,575,350,50),'好きな作物 → '+CROP_BY_ID[following].name,
+                           'profile_favorite',following,size=16)
             effect=self.state.get('goal_effect',0)
             next_effect=(effect+1)%3
             self.ui_button((642,575,351,50),'ゴール演出 '+('通常','葉っぱ','星')[effect]+' →','goal_effect',next_effect,size=16)
@@ -2851,7 +3142,7 @@ class Game:
         self.overlay_panel('ポーズ  /  MENU','ゲームを閉じている間も畑の成長は進みます。')
         unseen = unread_count(self.notice_feed, self.notice_seen)
         labels = [('ゲームに戻る','resume',None),('設定','settings',None),
-                  ('種と倉庫','overlay','inventory'),('ミッション','overlay','missions'),
+                  ('種と倉庫','overlay','inventory'),('育成・実績','overlay','progression'),
                   ('遊び方','help_menu',None),('お知らせ'+(' NEW' if unseen else ''),'notices',None),
                   ('衣装','costume',None),('イベント','event',None),('データ管理','data_menu',None),
                   ('メール','mail',None),('フレンド','friends',None),('MAP','map',None),
@@ -3034,6 +3325,12 @@ class Game:
             elif self.modal=='name_edit':self.draw_name_edit()
             elif self.modal=='event':self.draw_event()
             elif self.modal=='mail':self.draw_mail()
+            elif self.modal=='login_bonus':self.draw_login_bonus()
+            elif self.modal=='notifications':self.draw_notifications()
+            elif self.modal=='decor':self.draw_decor()
+            elif self.modal=='social':self.draw_social()
+            elif self.modal=='hud_settings':self.draw_hud_settings()
+            elif self.modal=='progression':self.draw_progression()
             elif self.modal=='friends':self.draw_friends()
             elif self.modal=='profile':self.draw_profile()
             elif self.modal=='profile_edit':self.draw_profile_edit()
@@ -3115,7 +3412,9 @@ def main():
                 probe.interior=place
                 probe.modal='interior'
                 probe.render()  # catches missing room labels and UI mapping
-            for modal in ('chest','travel','map','shop','inventory','daily_board'):
+            for modal in ('chest','travel','map','shop','inventory','daily_board',
+                          'login_bonus','notifications','decor','social','hud_settings','progression',
+                          'profile','mail','friends','event'):
                 probe.modal=modal
                 probe.render()  # new screens, map and storage buttons
             pygame.quit()

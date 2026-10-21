@@ -149,7 +149,7 @@ def public_profile(s):
     rec=s['arena_record']
     return {'uid':s['player_uid'],'name':s['player_name'],
         'bio':clean_bio(s.get('profile_bio','')), 'title':s.get('profile_title','farmer'),
-        'farm_level':s['farm_level'], 'arena_record':{k:rec[k] for k in ('wins','losses','draws','rating','best_streak')}}
+        'farm_level':s['farm_level'], 'favorite_crop':s.get('favorite_crop','kaiware'), 'arena_record':{k:rec[k] for k in ('wins','losses','draws','rating','best_streak')}}
 
 def cache_public_profiles(state,players):
     init_profile(state)

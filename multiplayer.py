@@ -29,6 +29,7 @@ from farm_mailbox import load as load_public_mail
 from v8_features import (field_action, buy_consumable, use_consumable, init_v8, restore_stamina,
                          exchange_event, new_outfit, OUTFIT_COLORS, receive_public_mail)
 from town_features import move_chest, rest_in_bed
+from life_hub import claim_login_reward, craft_decor, set_decor, claim_all_mail, EMOTES
 from player_movement import walkable_short_path, path_is_clear
 from coop_orders import new_board, view as board_view, contribute as contribute_order
 from kabuball_core import KabuballMatch
@@ -38,7 +39,7 @@ from profile_progress import (init_profile, public_profile, refresh_progress,
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 9
+PROTOCOL = 10
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -93,6 +94,7 @@ class RoomServer:
         self.coop_board = new_board()
         self.world_revision = 0
         self.friend_invites={}
+        self.party_invites={}
         self.duels = {}  # temporary server-authoritative mini-game matches
         self.next_duel_id = 0
         self.arena_matches = {}
@@ -139,7 +141,7 @@ class RoomServer:
                             'id': pid, 'name': safe_name(hello.get('name')),
                             'x': x, 'y': y, 'last': time.monotonic(), 'move_seq': -1, 'move_step_seq': 0,
                             'profile': profile, 'last_chat': 0., 'last_rescue': 0.,
-                            'uid':profile['player_uid'],
+                            'uid':profile['player_uid'], 'emote':'', 'emote_seq':0, 'emote_until':0., 'last_emote':0., 'party_id':None,
                         }
                         if is_host:
                             parent.host_id = pid
@@ -179,8 +181,9 @@ class RoomServer:
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                        for x in parent.friend_invites.get(pid, []) if x in parent.players],
+                                    'party': parent.party_view(pid),
                                     'story_nodes': parent.story_nodes,
-                                    'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')},
+                                    'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq')},
                                                      public_profile=public_profile(member['profile']))
                                                 for member in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
@@ -199,7 +202,7 @@ class RoomServer:
                                         or player['move_seq'] != last_ack_seq or arena_running):
                                     packets.append({
                                         'type': 'positions',
-                                        'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')},
+                                        'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq')},
                                                          public_profile=public_profile(member['profile']))
                                                     for member in parent.players.values()],
                                         'self_pos': [player['x'], player['y']],
@@ -258,7 +261,8 @@ class RoomServer:
                                     'leaderboard': parent.arena_leaderboard(),
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
-                                                      for x in parent.friend_invites.get(pid, []) if x in parent.players]}
+                                                      for x in parent.friend_invites.get(pid, []) if x in parent.players],
+                                    'party': parent.party_view(pid)}
                             elif kind == 'chat':
                                 parent._chat(pid, incoming.get('message'))
                             elif kind == 'ping':
@@ -275,6 +279,9 @@ class RoomServer:
                             parent._duel_disconnect(pid)
                             parent._arena_disconnect(pid)
                             parent.friend_invites.pop(pid,None)
+                            parent.party_invites.pop(pid,None)
+                            for target,inviter in list(parent.party_invites.items()):
+                                if inviter==pid:parent.party_invites.pop(target,None)
                             for invites in parent.friend_invites.values():
                                 if pid in invites:invites.remove(pid)
                             parent.players.pop(pid, None)
@@ -295,6 +302,14 @@ class RoomServer:
         # Host profile is the local save. Guest balances never enter this file.
         self.state = merged_view(self.host_profile, self.state['plots'], self.state['plot_preparation'])
         save_state(self.state, self.save_file)
+
+    def party_view(self,pid):
+        player=self.players[pid]
+        ident=player.get('party_id')
+        members=[{'id':q['id'],'name':q['name']}
+                 for q in self.players.values() if ident is not None and q.get('party_id')==ident]
+        inviter=self.players.get(self.party_invites.get(pid))
+        return {'members':members, 'invite':{'id':inviter['id'],'name':inviter['name']} if inviter else None}
 
     def _chat(self, pid, message):
         player = self.players[pid]
@@ -600,6 +615,66 @@ class RoomServer:
         profile['plots'] = self.state['plots']
         profile['plot_preparation'] = self.state['plot_preparation']
         loc = lambda key, radius: math.dist((p['x'], p['y']), INTERACTION_POINTS[key]) <= radius
+        # Room-host-validated personal rewards and non-currency social actions.
+        if action == 'party_invite':
+            target=self.players.get(data) if isinstance(data,str) else None
+            if not target or target is p:return '同じ部屋のプレイヤーを選択してください'
+            if target['uid'] not in profile.get('friend_ids',[]):return 'フレンドを招待してください'
+            if p.get('party_id') and p['party_id']==target.get('party_id'):
+                return '既に同じパーティです'
+            self.party_invites[target['id']]=pid
+            return f'{target["name"]}さんを協力パーティに招待しました'
+        if action == 'party_accept':
+            inviter=self.players.get(self.party_invites.pop(pid,None))
+            if not inviter:return '招待は期限切れか取り消されました'
+            party=inviter.get('party_id') or inviter['id']
+            inviter['party_id']=party;p['party_id']=party
+            return f'{inviter["name"]}さんのパーティに参加しました'
+        if action == 'party_leave':
+            if p.get('party_id') is None:return 'パーティに参加していません'
+            p['party_id']=None
+            return 'パーティから離脱しました'
+        if action == 'login_claim':
+            if claim_login_reward(profile):
+                self._save_host();return '本日のログイン報酬を受け取りました！'
+            return '本日のログイン報酬は受取済みです'
+        if action == 'mail_claim_all':
+            count = claim_all_mail(profile, load_public_mail())
+            if count:self._save_host()
+            return f'プレゼント {count}件を受け取りました'
+        if action == 'profile_favorite':
+            if not isinstance(data,str) or data not in CROP_BY_ID:return '作物を選んでください'
+            profile['favorite_crop']=data
+            self._save_host();return 'お気に入り作物を変更しました'
+        if action in ('decor_craft','decor_equip'):
+            if not loc('home', 100):return '自宅の近くで模様替えしてください'
+            if not isinstance(data,str):return '家具の指定が不正です'
+            ok = craft_decor(profile,data) if action=='decor_craft' else set_decor(profile,data)
+            if ok:self._save_host()
+            return '模様替えを保存しました' if ok else '材料が足りない、または選択できない家具です'
+        if action == 'emote':
+            now=time.monotonic()
+            if not isinstance(data,str) or data not in EMOTES:return 'エモートの指定が不正です'
+            if now-p.get('last_emote',0)<1.5:return 'エモートは少し時間をあけてください'
+            p['emote']=data;p['emote_seq']+=1;p['emote_until']=now+3.5;p['last_emote']=now
+            return 'エモートを表示しました'
+        if action == 'gift_item':
+            if not isinstance(data,dict):return 'プレゼント内容が不正です'
+            target_id=data.get('target')
+            target=self.players.get(target_id) if isinstance(target_id,str) else None
+            item=data.get('item');qty=data.get('count')
+            if (not target or target is p or item not in ('tea','riceball','lunch')
+                    or type(qty) is not int or qty not in (1,2,3)):
+                return '贈り物の宛先・数量が不正です'
+            if target['uid'] not in profile.get('friend_ids',[]):return 'フレンドにだけ送れます'
+            if math.dist((p['x'],p['y']),(target['x'],target['y']))>115:
+                return '相手に近づいてください'
+            if profile['consumables'][item]<qty:return 'プレゼントするアイテムが不足しています'
+            if target['profile']['consumables'][item]+qty>9999:return '相手の持ち物がいっぱいです'
+            profile['consumables'][item]-=qty
+            target['profile']['consumables'][item]+=qty
+            self._save_host()
+            return f'{target["name"]}さんにアイテムを{qty}個送りました'
         if action == 'coop_contribute':
             if not isinstance(data, dict):return '納品内容を確認してください'
             result = contribute_order(self.coop_board, data.get('id'), pid, profile,

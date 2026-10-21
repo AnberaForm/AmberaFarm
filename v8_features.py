@@ -43,12 +43,16 @@ def init_v8(state):
     from town_features import init_town
     init_profile(state)
     init_town(state)
+    from life_hub import init_life
+    init_life(state)
     return state
 
 
 def validate_v8(raw):
     """Reject malformed extensions, retain unknown prior v2 fields elsewhere."""
     s = init_v8(raw)
+    from life_hub import validate_life
+    validate_life(s)
     if type(s['stamina']) is not int or not 0 <= s['stamina'] <= MAX_STAMINA:
         raise ValueError('スタミナが不正です')
     if (isinstance(s['stamina_updated_at'],bool) or not isinstance(s['stamina_updated_at'],(int,float))
