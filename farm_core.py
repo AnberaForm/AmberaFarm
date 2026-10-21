@@ -170,7 +170,7 @@ def validate_state(raw):
                   'farm_xp','farm_level','farm_stat_seen','daily_board','profile_bio','profile_title',
                   'profile_cache','arena_record','goal_effect','home_chest',
                   'login_reward','favorite_crop','home_decor','home_decor_selected',
-                  'quick_quest_visible','hud_inventory_visible'):
+                  'quick_quest_visible','hud_inventory_visible','avatar_id'):
         if field in raw:
             initial[field]=raw[field]
     try:

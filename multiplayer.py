@@ -33,13 +33,15 @@ from life_hub import claim_login_reward, craft_decor, set_decor, claim_all_mail,
 from player_movement import walkable_short_path, path_is_clear
 from coop_orders import new_board, view as board_view, contribute as contribute_order
 from kabuball_core import KabuballMatch
+from character_avatars import IDS as AVATAR_IDS
+from neighbor_town import town_buy
 from profile_progress import (init_profile, public_profile, refresh_progress,
                               claim_daily, apply_arena_result, clean_bio, unlocked_titles)
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 10
+PROTOCOL = 11
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -642,6 +644,17 @@ class RoomServer:
             count = claim_all_mail(profile, load_public_mail())
             if count:self._save_host()
             return f'プレゼント {count}件を受け取りました'
+        if action == 'avatar_select':
+            if data not in AVATAR_IDS:return '選択できないキャラクターです'
+            profile['avatar_id']=data
+            self._save_host()
+            return 'キャラクター外観を切り替えました'
+        if action == 'neighbor_buy':
+            if not isinstance(data,dict):return '購入情報が不正です'
+            if nearest_travel_stop(p['x'],p['y'],100) is None:return '馬車の停留所へ戻ってください'
+            if town_buy(profile,data.get('crop'),data.get('count')):
+                self._save_host();return '隣町の種を購入しました'
+            return '購入できません。所持金・商品を確認してください'
         if action == 'profile_favorite':
             if not isinstance(data,str) or data not in CROP_BY_ID:return '作物を選んでください'
             profile['favorite_crop']=data

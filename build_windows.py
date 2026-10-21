@@ -38,7 +38,9 @@ def build(destination=None):
     story = ('data/story_events.json', 'data')
     announcements = ('data/announcements.json', 'data')
     mail = ('data/mail_campaigns.json', 'data')
-    game = invoke('AmberaGame', 'ambera_farm.py', [crops, ('assets/buildings', 'assets/buildings'), story, announcements, mail])
+    game = invoke('AmberaGame', 'ambera_farm.py', [crops, ('assets/buildings', 'assets/buildings'),
+                                     ('assets/avatars', 'assets/avatars'), ('assets/items', 'assets/items'),
+                                     story, announcements, mail])
     editor = invoke('AmberaStoryEditor', 'story_editor.py', [story, announcements])
     launcher = invoke('AmberaFarm', 'exe_launcher.py')
     for result in (game, editor, launcher):

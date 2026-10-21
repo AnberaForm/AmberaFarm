@@ -23,6 +23,7 @@ OUTFIT_COLORS = ((57,79,134),(167,79,83),(73,125,93),(188,143,59),(113,79,148),(
 def init_v8(state):
     """In-place, idempotent migration for old v2 saves."""
     state.setdefault('stamina', 5)
+    state.setdefault('avatar_id','original_girl')
     state.setdefault('stamina_updated_at', time.time())
     state.setdefault('plot_preparation', [0] * PLOT_COUNT)
     state.setdefault('consumables', {k: 0 for k in ITEMS})
@@ -53,6 +54,9 @@ def validate_v8(raw):
     s = init_v8(raw)
     from life_hub import validate_life
     validate_life(s)
+    from character_avatars import IDS
+    if s.get('avatar_id') not in IDS:
+        raise ValueError('キャラクター外観の指定が不正です')
     if type(s['stamina']) is not int or not 0 <= s['stamina'] <= MAX_STAMINA:
         raise ValueError('スタミナが不正です')
     if (isinstance(s['stamina_updated_at'],bool) or not isinstance(s['stamina_updated_at'],(int,float))
