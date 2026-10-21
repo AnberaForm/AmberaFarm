@@ -70,7 +70,7 @@ def test_coop_rejects_invalid_donation_and_short_inventory():
 
 
 def test_coop_network_board_state_and_separate_wallet(tmp_path):
-    assert PROTOCOL == 12
+    assert PROTOCOL == 13
     host=new_state();guest=new_state()
     host['warehouse']['kaiware']=2
     guest['warehouse']['kaiware']=1

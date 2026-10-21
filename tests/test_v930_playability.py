@@ -14,6 +14,7 @@ from farm_core import new_state
 from kabuball_core import KabuballMatch, screen_aim, cpu_input, valid_input
 from multiplayer import RoomServer, RoomClient
 from area_world import OUTDOOR, NEIGHBOR, area_view, at_facility
+from scene_maps import NEIGHBOR_STORE
 from world_map import INTERACTION_POINTS, TRAVEL_STOPS
 from profile_progress import public_profile
 
@@ -91,11 +92,11 @@ def test_room_keyboard_diagonal_speed_chat_return_and_nested_menu(game):
     assert math.dist(before,game.interior_pos)==pytest.approx(9.)
     game.toggle_chat()
     game.close_chat()
-    assert game.modal=='interior' and game.area=='room:hall'
+    assert game.modal is None and game.area=='room:hall'
     game.modal='arena'
     game.close_overlay()
-    assert game.modal=='interior'
-    game.close_overlay()
+    assert game.modal is None and game.area=='room:hall'
+    game.do_action('interior_exit',None)
     assert game.area==OUTDOOR and game.interior is None and game.modal is None
 
 
@@ -123,9 +124,10 @@ def test_avatar_sheets_all_directions_and_costume_are_used(game):
     game.state['outfits'].append({'name':'青い服','shirt':3,'hat':5})
     game.state['outfit_index']=1
     assert public_profile(game.state)['outfit']=={'shirt':3,'hat':5}
-    for modal in ('avatars','costume','arena','neighbor_town','neighbor_shop'):
+    for modal in ('avatars','costume','arena','neighbor_shop'):
         game.modal=modal
         game.render()  # catches missing asset APIs and UI crashes
+    game.enter_area(NEIGHBOR);game.render()
 
 
 @pytest.mark.parametrize('direction,delta',[('right',(1,0)),('left',(-1,0)),('up',(0,-1)),('down',(0,1))])
@@ -265,6 +267,8 @@ def test_interior_facilities_neighbor_shop_and_remote_gift_distance(connected_ro
         assert '近づいて' in room._action(a.id,{'action':'neighbor_buy','value':{'crop':'corn','count':1}})
         assert p['profile']['coins']==coins
         p.update(scene_x=637.,scene_y=330.)
+        assert room._enter_area(a.id,NEIGHBOR_STORE)=='移動しました'
+        p.update(scene_x=430.,scene_y=350.)
         assert '購入しました' in room._action(a.id,{'action':'neighbor_buy','value':{'crop':'corn','count':1}})
 
 
