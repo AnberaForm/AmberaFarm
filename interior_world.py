@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Walkable local interiors. Geometry is screen-local and never overwrites outdoor coordinates."""
+"""Interior facility catalog. Independent runtime map geometry is in scene_maps."""
 from dataclasses import dataclass
 
 ROOMS=('home','shop','shipping','fish_market','general_store','hall','greenhouse','workshop','cafe')
@@ -13,7 +13,7 @@ class Station:
     action: str
 
 STATIONS={
- 'home':(Station('ベッド',367,302,'home_rest'),Station('収納',818,306,'chest'),Station('家具',558,260,'decor'),Station('データ管理',911,451,'data_menu')),
+ 'home':(Station('ベッド',400,322,'home_rest'),Station('収納',818,306,'chest'),Station('家具',600,302,'decor'),Station('データ管理',1035,437,'data_menu')),
  'shop':(Station('たねを買う',430,289,'shop'),),
  'shipping':(Station('出荷する',480,303,'shipping'),),
  'fish_market':(Station('魚を売る',470,299,'fish_market'),),

@@ -24,7 +24,7 @@ ALLOWED={
     'v8_features.py','player_movement.py','inventory_grid.py','profile_progress.py',
     'life_hub.py','town_features.py','coop_orders.py','farm_mailbox.py','notices.py',
     'kabuball_core.py','character_avatars.py','avatar_animation.py','area_world.py',
-    'interior_world.py','neighbor_town.py','save_slots.py','story_admin_auth.py',
+    'interior_world.py','neighbor_town.py','save_slots.py','story_admin_auth.py','scene_maps.py','pixel_art.py',
     'START_GAME.cmd','DIAGNOSE.cmd','START_STORY_EDITOR.cmd','BUILD_EXE.cmd',
     'requirements.txt','data/story_events.json','data/announcements.json','data/mail_campaigns.json',
     *{'assets/crops/'+name+'.png' for name in (
@@ -37,6 +37,9 @@ ALLOWED={
     *{'assets/avatars/'+name+'_walk.png' for name in (
         'original_girl','mint_girl','blue_girl','blonde_girl','farmer_boy','cafe_boy','silver_boy')},
     *{'assets/items/'+name+'.png' for name in ('tea','riceball','lunch')},
+    *{'assets/scenes/'+name+'.png' for name in ('home','shop','shipping','fish_market',
+        'general_store','hall','greenhouse','workshop','cafe','mizuho')},
+    *{'assets/scenery/'+name+'.png' for name in ('props','fish')},
 }
 MAX_PACKAGE=32*1024*1024
 

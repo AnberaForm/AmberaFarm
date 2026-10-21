@@ -36,6 +36,8 @@ from kabuball_core import KabuballMatch
 from character_avatars import IDS as AVATAR_IDS
 from neighbor_town import town_buy
 from interior_world import SPAWN as ROOM_SPAWN
+from scene_maps import (NEIGHBOR_STORE, NEIGHBOR_DOOR, spawn as scene_spawn,
+                        path_clear as scene_path_clear, nearby as scene_nearby)
 from area_world import (OUTDOOR, NEIGHBOR, AREAS, can_enter, at_facility,
                         area_view, valid_scene_point, DIRECTIONS)
 from profile_progress import (init_profile, public_profile, refresh_progress,
@@ -44,7 +46,7 @@ from profile_progress import (init_profile, public_profile, refresh_progress,
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 12
+PROTOCOL = 13
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -433,7 +435,8 @@ class RoomServer:
             return '入口または馬車の停留所に近づいてください'
         if any(pid in m.ids and m.status in ('pending','active') for m in self.arena_matches.values()):
             return '対戦中は移動できません'
-        p.update(area=target, scene_x=ROOM_SPAWN[0], scene_y=ROOM_SPAWN[1],
+        sx, sy = scene_spawn(target, p.get('area', OUTDOOR))
+        p.update(area=target, scene_x=sx, scene_y=sy,
                  scene_seq=-1, scene_revision=p.get('scene_revision',0)+1,
                  scene_last=time.monotonic(), fishing=None, facing='up')
         return '移動しました'
@@ -448,11 +451,13 @@ class RoomServer:
             return
         p['scene_seq'] = seq
         x, y = data.get('x'), data.get('y')
-        if not valid_scene_point(x,y):
+        if not valid_scene_point(x,y,p['area']):
             return
         now = time.monotonic()
         allowed = max(14., 205*min(.6,max(0,now-p['scene_last']))*1.35+9)
         if math.dist((p['scene_x'],p['scene_y']),(x,y)) > allowed:
+            return
+        if not scene_path_clear(p['area'], (p['scene_x'],p['scene_y']), (x,y)):
             return
         p.update(scene_x=x, scene_y=y, scene_last=now)
         if data.get('facing') in DIRECTIONS:
@@ -771,7 +776,7 @@ class RoomServer:
             return 'キャラクター外観を切り替えました'
         if action == 'neighbor_buy':
             if not isinstance(data,dict):return '購入情報が不正です'
-            if p.get('area') != NEIGHBOR or math.dist((p['scene_x'],p['scene_y']),(637,300)) > 115:
+            if p.get('area') != NEIGHBOR_STORE or scene_nearby(NEIGHBOR_STORE,(p['scene_x'],p['scene_y']),115) is None:
                 return 'みずほ町のお店に近づいてください'
             if town_buy(profile,data.get('crop'),data.get('count')):
                 self._save_host();return '隣町の種を購入しました'

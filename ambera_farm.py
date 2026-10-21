@@ -32,6 +32,10 @@ except ImportError:
 from save_slots import slot_file, slot_summaries, legacy_migrate, load_slot, save_slot, new_slot, import_offline_to_online
 from character_avatars import AVATARS, IDS as AVATAR_IDS, LABELS as AVATAR_LABELS, valid_avatar
 from avatar_animation import AvatarAtlas, WalkCycle
+from pixel_art import PixelArt
+from scene_maps import (MAPS as SCENE_MAPS, NEIGHBOR_STORE, NEIGHBOR_DOOR,
+                       spawn as scene_spawn, exit_target, at_exit, nearby as scene_nearby,
+                       move as scene_move, camera as scene_camera, stations as scene_stations)
 from area_world import OUTDOOR, NEIGHBOR, AREAS, valid_scene_point
 from neighbor_town import TOWN_NAME, shop_rows, town_buy
 from interior_world import STATIONS, SPAWN as ROOM_SPAWN, move as room_move, nearby as room_nearby
@@ -445,6 +449,7 @@ class Game:
                     except pygame.error:pass
         self.item_icons={}
         self.avatar_atlas=AvatarAtlas(ROOT)
+        self.pixel_art=PixelArt(ROOT)
         self.walk_cycles={}
         for ident in ('tea','riceball','lunch'):
             location=ROOT/'assets'/'items'/f'{ident}.png'
@@ -514,6 +519,10 @@ class Game:
         self.scene_move_seq=0
         self.scene_ack=-1
         self.scene_sent={}
+        self.warp_started=0.
+        self.warp_pending=False
+        self.warp_pending_at=0.
+        self.warp_cooldown=0.
         self.chat_return_modal=None
         self.interior_pos=list(ROOM_SPAWN)
         self.neighbor_pos=[640.,510.]
@@ -769,6 +778,8 @@ class Game:
                 story_nodes=self.story_nodes,fresh=False)
             self.room_pin=self.online_server.pin
             self.online_client=RoomClient('127.0.0.1:'+str(self.online_server.port),self.room_pin,self.state['player_name'],profile=self.state,host_token=self.online_server.host_token)
+            self.reset_map_state()
+            self.player=list(self.online_client.spawn)
             self.online_guest=False
             self.scene='world';self.modal=None
             self.say(f'部屋を作成！ LAN: {self.lan_address()}:{self.online_server.port} / PIN {self.room_pin}', 30)
@@ -784,6 +795,7 @@ class Game:
         try:
             self.offline_state=copy.deepcopy(self.state)
             self.online_client=RoomClient(self.join_fields['address'].strip(),self.join_fields['pin'],self.join_fields['name'],profile=self.state)
+            self.reset_map_state()
             self.online_guest=True
             self.player=list(self.online_client.spawn)
             self.movement_trail.clear()
@@ -1008,6 +1020,7 @@ class Game:
             elif packet.get('type') == 'chat_delta':
                 self.receive_chat(packet.get('chat', []))
             elif packet.get('type') == 'result':
+                self.warp_pending=False
                 if self.modal=='fishing_wait' and not packet.get('fishing'):
                     self.modal=self.base_modal()
                 warp=packet.get('warp_to')
@@ -1065,6 +1078,8 @@ class Game:
             self.save_guest_profile(True)
 
     def rescue_player(self):
+        if self.area!=OUTDOOR:
+            self.enter_area(exit_target(self.area));return
         """F9 always leads to a valid spawn; host also authorizes online teleports."""
         now = time.monotonic()
         if now - self.last_rescue < 12:
@@ -1156,6 +1171,7 @@ class Game:
             self.player=list(self.state['player'])
             if not can_stand(*self.player):self.player=safe_destination(self.player)
             self.selected=self.state['selected_crop']
+            self.reset_map_state()
             self.inventory_layout=reconcile_layout(self.settings.get('inventory_layout'),self.state)
             self.settings['slot_kind']=kind;self.settings['slot_index']=index
             store_settings(self.settings)
@@ -1192,26 +1208,45 @@ class Game:
                 if self.state.get('outfit_index',0)>0 else None)
 
     def base_modal(self):
-        return 'interior' if self.area.startswith('room:') else 'neighbor_town' if self.area==NEIGHBOR else None
+        # Walking a map is gameplay. Only menus and transactions are overlays.
+        return None
+
+    def reset_map_state(self):
+        self.area=OUTDOOR;self.interior=None
+        self.scene_revision=0;self.scene_move_seq=0;self.scene_ack=-1
+        self.scene_sent.clear();self.warp_pending=False;self.warp_started=0.
+        self.interior_pos=list(ROOM_SPAWN);self.neighbor_pos=list(scene_spawn(NEIGHBOR))
+        self.held_keys.clear();self.modal=None
 
     def enter_area(self,target):
+        if target not in AREAS:return
         if self.online_client:
+            if self.warp_pending and time.monotonic()-self.warp_pending_at<3:return
+            self.warp_pending=True;self.warp_pending_at=time.monotonic()
             self.online_client.action('area_enter',target)
         else:
-            self.apply_area({'area':target,'pos':list(ROOM_SPAWN),'revision':self.scene_revision+1,'seq':-1})
+            self.apply_area({'area':target,'pos':list(scene_spawn(target,self.area)),
+                             'revision':self.scene_revision+1,'seq':-1})
 
     def apply_area(self,view):
         if not isinstance(view,dict) or view.get('area') not in AREAS:
             return
         target=view['area']
         revision=view.get('revision',0)
+        if type(revision) is not int or revision<self.scene_revision:return
         if target!=self.area or revision!=self.scene_revision:
+            source=self.area
             self.area=target
+            self.warp_pending=False
+            self.warp_started=time.monotonic()
+            self.warp_cooldown=self.warp_started+.65
             self.scene_revision=revision
             self.scene_move_seq=0;self.scene_ack=-1;self.scene_sent.clear()
             self.interior=target[5:] if target.startswith('room:') else None
             position=view.get('pos',list(ROOM_SPAWN))
-            if not valid_scene_point(*position):position=list(ROOM_SPAWN)
+            if (not isinstance(position,(list,tuple)) or len(position)!=2
+                    or target!=OUTDOOR and not valid_scene_point(*position,target)):
+                position=list(scene_spawn(target,source))
             self.interior_pos=list(position)
             self.neighbor_pos=list(position)
             self.modal=self.base_modal()
@@ -1223,7 +1258,7 @@ class Game:
         self.scene_ack=seq
         sent=self.scene_sent.get(seq)
         point=view.get('pos')
-        if sent is not None and isinstance(point,list) and len(point)==2 and valid_scene_point(*point):
+        if sent is not None and isinstance(point,list) and len(point)==2 and valid_scene_point(*point,target):
             if math.dist(sent,point)>3:
                 if target==NEIGHBOR:self.neighbor_pos=list(point)
                 else:self.interior_pos=list(point)
@@ -1238,10 +1273,7 @@ class Game:
             elif self.online_client:self.online_client.action('arena_forfeit',None)
             self.modal='arena'
             return
-        if self.modal==self.base_modal() and self.area!=OUTDOOR:
-            self.enter_area(OUTDOOR)
-        else:
-            self.modal=self.base_modal()
+        self.modal=None
 
     def input_down(self,*codes):
         if self.input_suspended or self.ime_composing:return False
@@ -1255,9 +1287,27 @@ class Game:
         if not length:return
         self.facing=('right' if dx>0 else 'left') if abs(dx)>abs(dy) else ('down' if dy>0 else 'up')
         point=self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
-        after=list(room_move(point,dx/length*180*dt,dy/length*180*dt))
+        after=list(scene_move(self.area,point,dx/length*180*dt,dy/length*180*dt))
         if self.area==NEIGHBOR:self.neighbor_pos=after
         else:self.interior_pos=after
+        if at_exit(self.area,after) and time.monotonic()>self.warp_cooldown:
+            self.enter_area(exit_target(self.area))
+
+    def area_interact(self):
+        position=self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
+        if at_exit(self.area,position):
+            self.enter_area(exit_target(self.area));return
+        if self.area==NEIGHBOR:
+            if math.dist(position,NEIGHBOR_DOOR)<=92:self.enter_area(NEIGHBOR_STORE)
+            else:self.say('たね屋の入口か、南の馬車乗り場に近づいてください。',4)
+            return
+        station=scene_nearby(self.area,position)
+        if not station:
+            self.say('家具やカウンターの近くでEキーを押してください。',4);return
+        if station.action=='neighbor_catalog':self.modal='neighbor_shop'
+        elif station.action in ('shop','shipping','fish_market','general_store'):
+            self.do_action('interior_open',station.action)
+        else:self.do_action(station.action,None)
 
     def receive_fishing(self,view):
         if self.modal not in ('fishing_wait','fishing','fishing_result') or not isinstance(view,dict):return
@@ -1359,6 +1409,7 @@ class Game:
             self.say('保存データ保護中のため、新規開始はできません。',9)
             return
         self.state = init_v8(new_state())
+        self.reset_map_state()
         self.selected = 'kaiware'
         self.player = list(self.state['player'])
         self.persist(True)
@@ -1393,6 +1444,7 @@ class Game:
                 loaded = load_json(f)
                 save_slot(loaded,self.slot_kind,self.slot_index)
                 self.state = init_v8(loaded)
+                self.reset_map_state()
                 self.player = list(loaded['player'])
                 self.selected = loaded['selected_crop']
                 self.read_only = False
@@ -1455,6 +1507,8 @@ class Game:
         return action,data
 
     def interact(self):
+        if self.area!=OUTDOOR:
+            self.area_interact();return
         action,data=self.context()
         if action is None:
             self.say('看板・施設の入口・畑の近くで E を押してください。');return
@@ -1543,10 +1597,14 @@ class Game:
         elif action=='neighbor_visit':
             self.enter_area(NEIGHBOR)
         elif action=='neighbor_shop':
-            if math.dist(self.neighbor_pos,(637,300))<=100:self.modal='neighbor_shop'
-            else:self.say('お店のカウンターに近づいてEキーを押してください。')
+            if self.area==NEIGHBOR_STORE:self.area_interact()
+            elif self.area==NEIGHBOR and math.dist(self.neighbor_pos,NEIGHBOR_DOOR)<=92:
+                self.enter_area(NEIGHBOR_STORE)
+            else:self.say('たね屋の入口へ歩いてEキーを押してください。')
         elif action=='neighbor_buy':
             kind,count=val
+            if self.area!=NEIGHBOR_STORE or scene_nearby(self.area,self.interior_pos) is None:
+                self.say('みずほ町の店内でカウンターに近づいてください。');return
             if self.online_client:self.online_client.action('neighbor_buy',{'crop':kind,'count':count})
             elif town_buy(self.state,kind,count):self.persist(True);self.say('みずほ町で種を購入しました！')
             else:self.say('所持金が足りないか、販売していない種です。')
@@ -1555,11 +1613,9 @@ class Game:
                 if self.online_client:self.online_client.action('avatar_select',val)
                 else:self.state['avatar_id']=val;self.persist(True)
         elif action=='interior_interact':
-            station=room_nearby(self.interior,self.interior_pos)
-            if station:self.do_action('interior_open' if station.action in ('shop','shipping','fish_market','general_store') else station.action,station.action if station.action in ('shop','shipping','fish_market','general_store') else None)
-            else:self.say('家具やカウンターの近くでEキーを押してください。',4)
-        elif action=='interior_exit':self.enter_area(OUTDOOR)
-        elif action=='neighbor_exit':self.enter_area(OUTDOOR)
+            self.area_interact()
+        elif action=='interior_exit':self.enter_area(exit_target(self.area))
+        elif action=='neighbor_exit':self.enter_area(exit_target(self.area))
         elif action=='login_bonus':self.modal='login_bonus'
         elif action=='login_claim':
             if self.online_client:self.online_client.action('login_claim',None)
@@ -1845,6 +1901,7 @@ class Game:
             if self.online_client:self.stop_online()
             else:self.persist(True)
             self.reload_story()
+            self.reset_map_state()
             self.scene='title';self.modal=None
         elif action=='resume':self.modal=None
         elif action=='quit':
@@ -2161,7 +2218,7 @@ class Game:
                         self.do_action(action,val)
                         break
                 else:
-                    if self.scene=='world' and not self.modal:
+                    if self.scene=='world' and not self.modal and self.area==OUTDOOR:
                         wx=self.mouse[0]+self.camera[0]
                         wy=self.mouse[1]-VIEW_TOP+self.camera[1]
                         for idx in range(PLOT_COUNT):
@@ -2180,6 +2237,7 @@ class Game:
         self.camera[1]=max(0,min(WORLD_H*TILE-VIEW_HEIGHT,self.player[1]-VIEW_HEIGHT*.52))
 
     def draw_pixel_tree(self,loc_x,loc_y):
+        if self.pixel_art.draw(self.world_layer,'tree',(loc_x-10,loc_y-34,55,70)):return
         s=self.world_layer
         pygame.draw.rect(s,(70,54,39),(loc_x+12,loc_y+15,10,18))
         for rx,ry,w,h,col in (
@@ -2259,10 +2317,8 @@ class Game:
         for label,(stop_name,(wx,wy)) in TRAVEL_STOPS.items():
             x,y=int(wx-cx),int(wy-cy)
             if x < -80 or x > BASE_W+80 or y < -80 or y > VIEW_HEIGHT+80:continue
-            pygame.draw.rect(w,(99,69,50),(x-3,y-31,6,43))
-            pygame.draw.rect(w,(237,219,162),(x-24,y-37,48,28))
-            pygame.draw.rect(w,(107,74,48),(x-24,y-37,48,28),2)
-            text(w,self.fonts,'馬車',(x,y-25),15,INK,True,True)
+            self.pixel_art.draw(w,'carriage',(x-34,y-49,78,62))
+            text(w,self.fonts,'馬車',(x,y-63),15,WHITE,True,True)
         # Fishing float marker / pier sign.
         px=int(FISH_PIER[0]-cx);py=int(FISH_PIER[1]-cy)
         pygame.draw.rect(w,(102,66,46),(px-3,py-40,7,39))
@@ -2311,44 +2367,25 @@ class Game:
                 else:
                     pygame.draw.rect(w,(49,72,50),(x-19,y+18,38,5))
                     pygame.draw.rect(w,(124,197,104),(x-19,y+18,int(38*p),5))
-        # Mission board marker.
+        # Generated transparent scenery sprites keep the existing outdoor geometry.
         bx=int(26*TILE-cx);by=int(16*TILE-cy)
-        pygame.draw.rect(w,(87,62,40),(bx+4,by+12,6,34))
-        pygame.draw.rect(w,(87,62,40),(bx+27,by+12,6,34))
-        pygame.draw.rect(w,(232,206,142),(bx-5,by-4,46,37))
-        pygame.draw.rect(w,(108,66,44),(bx-5,by-4,46,37),4)
-        pygame.draw.rect(w,(175,91,61),(bx+4,by+10,29,4))
-        pygame.draw.rect(w,(175,91,61),(bx+8,by+20,19,3))
-        # Market-square fountain and festival planters (non-solid scenery).
+        self.pixel_art.draw(w,'quest_board',(bx-17,by-35,67,80))
         fx=int(31*TILE-cx);fy=int(17*TILE-cy)
-        pygame.draw.ellipse(w,(106,115,95),(fx-45,fy-13,88,50))
-        pygame.draw.ellipse(w,(134,195,193),(fx-37,fy-12,72,38))
-        pygame.draw.ellipse(w,(191,220,209),(fx-22,fy-9,41,25),3)
+        self.pixel_art.draw(w,'fountain',(fx-53,fy-58,106,98))
         for tx,ty in ((22,13),(34,13),(22,21),(34,21),(41,12),(15,22)):
             dx=int(tx*TILE-cx);dy=int(ty*TILE-cy)
-            pygame.draw.rect(w,(131,87,55),(dx+8,dy+13,17,17))
-            pygame.draw.rect(w,(67,128,69),(dx+5,dy+3,21,14))
-            pygame.draw.rect(w,(234,167,184),(dx+13,dy+2,7,7))
+            self.pixel_art.draw(w,'plant',(dx,dy-12,37,48))
         for building in BUILDINGS:
             self.draw_house(building.tile_x*TILE,building.tile_y*TILE,
                             building.tile_w*TILE,building.tile_h*TILE,
                             building.label,building.door(),building.key)
-        # Talkable fishing NPC in a blue jacket and straw hat; not a supplied asset.
-        nx=int(FISHERMAN[0]-cx);ny=int(FISHERMAN[1]-cy)
-        pygame.draw.ellipse(w,(46,88,79),(nx-12,ny+11,24,8))
-        pygame.draw.rect(w,(48,93,144),(nx-9,ny-2,18,20))
-        pygame.draw.rect(w,(232,186,137),(nx-8,ny-19,16,17))
-        pygame.draw.rect(w,(149,96,52),(nx-14,ny-22,27,7))
-        pygame.draw.rect(w,(214,167,95),(nx-9,ny-27,17,8))
-        text(w,self.fonts,'ナギ',(nx,ny-48),16,WHITE,True,True)
-        for nxw,nyw,coat,label in ((GUIDE_POS[0],GUIDE_POS[1],(166,81,83),'ミオ'),
-                                   (MERCHANT_POS[0],MERCHANT_POS[1],(181,147,55),'店主')):
+        for nxw,nyw,aid,label in ((FISHERMAN[0],FISHERMAN[1],'farmer_boy','ナギ'),
+                                 (GUIDE_POS[0],GUIDE_POS[1],'mint_girl','ミオ'),
+                                 (MERCHANT_POS[0],MERCHANT_POS[1],'cafe_boy','店主')):
             ax,ay=int(nxw-cx),int(nyw-cy)
-            pygame.draw.ellipse(w,(51,78,48),(ax-10,ay+13,22,8))
-            pygame.draw.rect(w,coat,(ax-9,ay-1,18,17))
-            pygame.draw.rect(w,(231,186,140),(ax-7,ay-17,15,16))
-            pygame.draw.rect(w,(88,60,45),(ax-9,ay-19,19,6))
-            text(w,self.fonts,label,(ax,ay-45),15,WHITE,True,True)
+            self.draw_avatar(w,aid,0,ax,ay,motion_key='npc_'+label,
+                             position=(nxw,nyw),area=OUTDOOR)
+            text(w,self.fonts,label,(ax,ay-65),15,WHITE,True,True)
         for person in self.remote_players:
             if person.get('area',OUTDOOR)!=OUTDOOR:continue
             rx,ry=int(person['x']-cx),int(person['y']-cy)
@@ -2406,7 +2443,7 @@ class Game:
         pygame.draw.rect(s,(31,49,37),(0,VIEW_TOP+VIEW_HEIGHT,BASE_W,BASE_H-(VIEW_TOP+VIEW_HEIGHT)))
         day,h,m=clock_at(self.state)
         text(s,self.fonts,'アンベラ牧場',(23,12),27,CREAM,True)
-        text(s,self.fonts,'地域：'+district_at(*self.player),((607 if self.online_client else 25),49),13,GOLD_LIGHT,True,max_width=270)
+        text(s,self.fonts,'地域：'+(district_at(*self.player) if self.area==OUTDOOR else SCENE_MAPS[self.area].name),((607 if self.online_client else 25),49),13,GOLD_LIGHT,True,max_width=270)
         if self.online_client:text(s,self.fonts,f'ONLINE {len(self.remote_players)+1}/{8}  PIN {self.room_pin}',(22,53),13,GOLD_LIGHT,True)
         if self.show_performance:
             ping = self.online_client.latency_ms if self.online_client else None
@@ -2419,6 +2456,9 @@ class Game:
         # Info / status strip.
         if self.message and time.monotonic()<self.message_until:
             msg=self.message
+        elif self.area!=OUTDOOR:
+            station=scene_nearby(self.area,self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos)
+            msg='E : '+station.label if station else 'WASD 移動 | E 調べる | 出口へ歩くと移動 | Esc メニュー'
         elif self.read_only:
             msg='注意：セーブ異常のため保存停止中。F7でセーブを読み込んでください。'
         else:
@@ -2488,14 +2528,9 @@ class Game:
             for j,entry in enumerate(items[self.hud_inventory_page*6:self.hud_inventory_page*6+6]):
                 kind,ident,label,count=entry;x=1081+(j%2)*97;y=419+(j//2)*55
                 box(s,(x,y,90,50),CREAM,BROWN,4,2)
-                if kind in ('seed','crop'):
-                    self.assets.draw_crop(s,ident,(x+3,y+5,37,35))
-                elif kind=='fish':
-                    pygame.draw.ellipse(s,FISH_BY_ID[ident].color,(x+6,y+15,35,19))
-                else:
-                    text(s,self.fonts,'♥' if kind=='item' else '★',(x+10,y+8),22,RED,True)
-                text(s,self.fonts,str(count),(x+84,y+30),15,BROWN,True,True)
-                text(s,self.fonts,label,(x+3,y+40),10,BROWN,max_width=82)
+                self.draw_inventory_icon(entry,x+3,y+3,35,29)
+                text(s,self.fonts,str(count),(x+78,y+20),15,BROWN,True,True)
+                text(s,self.fonts,label,(x+3,y+32),9,BROWN,max_width=82)
             text(s,self.fonts,f'{self.hud_inventory_page+1}/{page_count}  ホイールで切替',
                  (1084,590),11,CREAM)
         show_quests=(self.settings.get('quick_quest_visible',True) if self.online_client
@@ -2510,7 +2545,11 @@ class Game:
                      (25,230+i*42),12,color)
             self.register('daily_board',(13,164,195,138))
         if self.local_emote and time.monotonic()<self.local_emote_until:
-            px=int(self.player[0]-self.camera[0]);py=int(self.player[1]-self.camera[1])+VIEW_TOP
+            point=self.player if self.area==OUTDOOR else self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
+            if self.area==OUTDOOR:
+                px,py=point[0]-self.camera[0],point[1]-self.camera[1]
+            else:px,py=self.area_to_screen(point)
+            px,py=int(px),int(py)+VIEW_TOP
             if 0<px<BASE_W and VIEW_TOP<py<VIEW_TOP+VIEW_HEIGHT:
                 box(s,(max(0,px-57),py-78,114,29),PALE,BROWN,6,2)
                 text(s,self.fonts,EMOTES.get(self.local_emote,''),(max(0,px-53),py-73),16,BROWN,True,max_width=106)
@@ -2549,18 +2588,7 @@ class Game:
 
     def draw_home_furniture(self):
         key=self.state.get('home_decor_selected','plant')
-        if key=='plant':
-            pygame.draw.rect(self.stage,(150,94,64),(839,365,62,46))
-            pygame.draw.ellipse(self.stage,(83,160,79),(825,331,94,45))
-        elif key=='rug':
-            pygame.draw.ellipse(self.stage,(117,160,95),(804,374,122,55))
-            pygame.draw.ellipse(self.stage,(219,188,109),(822,390,87,22))
-        elif key=='table':
-            pygame.draw.rect(self.stage,(102,66,46),(841,379,80,51))
-            pygame.draw.rect(self.stage,(183,120,71),(826,359,107,20))
-        elif key=='lamp':
-            pygame.draw.rect(self.stage,(79,64,45),(857,366,16,68))
-            pygame.draw.circle(self.stage,(247,226,123),(863,345),30)
+        self.pixel_art.draw(self.stage,key,(810,328,130,113))
 
     def draw_decor(self):
         self.overlay_panel('自宅の模様替え / HOME DESIGN','収穫した作物で家具を作ろう。作った家具は自宅に飾れます。')
@@ -2643,6 +2671,18 @@ class Game:
         self.ui_button((450,565,380,50),'通知センターを開く','notifications',size=17)
 
     def draw_minimap(self):
+        if self.area!=OUTDOOR:
+            spec=SCENE_MAPS[self.area];x,y=BASE_W-209,VIEW_TOP+14
+            box(self.stage,(x-8,y-8,201,148),DARK,CREAM,4,2)
+            background=self.pixel_art.maps.get(spec.asset)
+            if background is not None:self.stage.blit(pygame.transform.scale(background,(185,129)),(x,y))
+            pos=self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
+            pygame.draw.circle(self.stage,GOLD_LIGHT,(x+int(pos[0]/spec.size[0]*185),y+int(pos[1]/spec.size[1]*129)),4)
+            for person in self.remote_players:
+                if person.get('area')==self.area:
+                    pygame.draw.circle(self.stage,WHITE,(x+int(person['scene_x']/spec.size[0]*185),y+int(person['scene_y']/spec.size[1]*129)),3)
+            text(self.stage,self.fonts,spec.name,(x+6,y+5),12,WHITE,True)
+            self.register('map',(x-8,y-8,201,148));return
         x,y=BASE_W-209,VIEW_TOP+14
         s=self.stage
         pygame.draw.rect(s,(38,56,42),(x-8,y-8,201,148),border_radius=6)
@@ -2660,6 +2700,7 @@ class Game:
         pygame.draw.circle(s,(255,254,250),(px,py),5)
         pygame.draw.circle(s,(42,72,72),(px,py),5,2)
         for other in self.remote_players:
+            if other.get('area',OUTDOOR)!=OUTDOOR:continue
             ox=x+int(other['x']/(WORLD_W*TILE)*185)
             oy=y+int(other['y']/(WORLD_H*TILE)*129)
             pygame.draw.circle(s,GOLD_LIGHT,(ox,oy),4)
@@ -2799,11 +2840,7 @@ class Game:
                 box(self.stage,(x,y,16,15),(73,113,62),None,2)
                 text(self.stage,self.fonts,'S',(x+4,y-1),11,WHITE,True)
         elif kind=='fish':
-            fish=FISH_BY_ID[ident]
-            cx=x+width//2;cy=y+height//2
-            pygame.draw.ellipse(self.stage,fish.color,(x+5,cy-11,width-11,23))
-            pygame.draw.polygon(self.stage,fish.color,[(x+8,cy),(x,cy-12),(x,cy+12)])
-            pygame.draw.circle(self.stage,INK,(cx+9,cy-5),2)
+            self.pixel_art.draw(self.stage,ident,(x,y,width,height))
         elif kind=='item':
             icon=self.item_icons.get(ident)
             if icon:self.stage.blit(pygame.transform.scale(icon,(width,height)),(x,y))
@@ -2912,9 +2949,7 @@ class Game:
         pygame.draw.rect(self.stage,(141,226,153),(rect.x+10,bob_y-range_h,rect.w-20,range_h*2))
         pygame.draw.rect(self.stage,(255,241,195),(rect.x+7,bob_y-8,rect.w-14,16))
         fish_y=yy(r.fish_y)
-        pygame.draw.ellipse(self.stage,fish.color,(rect.x+28,fish_y-13,55,26))
-        pygame.draw.polygon(self.stage,fish.color,[(rect.x+28,fish_y),(rect.x+9,fish_y-15),(rect.x+9,fish_y+15)])
-        pygame.draw.circle(self.stage,(42,48,45),(rect.x+69,fish_y-4),3)
+        self.pixel_art.draw(self.stage,fish.id,(rect.x+9,fish_y-19,86,38))
         text(self.stage,self.fonts,'釣れるまで',(759,206),21,INK,True)
         bar(self.stage,pygame.Rect(755,248,267,29),r.progress/100,(121,204,117),(67,97,60))
         text(self.stage,self.fonts,f'{int(r.progress)} %',(858,289),23,GREEN_DARK,True)
@@ -2949,8 +2984,7 @@ class Game:
         for i,f in enumerate(FISH):
             x,y=224+(i%2)*431,196+(i//2)*105
             box(self.stage,(x,y,407,94),CREAM,BROWN,7,3)
-            pygame.draw.ellipse(self.stage,f.color,(x+14,y+22,55,28))
-            pygame.draw.polygon(self.stage,f.color,[(x+18,y+35),(x+3,y+23),(x+3,y+47)])
+            self.pixel_art.draw(self.stage,f.id,(x+5,y+12,68,58))
             text(self.stage,self.fonts,f.name,(x+81,y+10),19,INK,True,max_width=175)
             qty=self.state['fish_inventory'][f.id]
             text(self.stage,self.fonts,f'{f.rarity} / {f.price} G / 在庫 {qty}',(x+82,y+39),15,GREEN_DARK)
@@ -3056,98 +3090,100 @@ class Game:
         self.ui_button((794,585,222,40),'一覧へ戻る','notice_back',size=16)
 
     def draw_interior(self):
-        names={'home':'自宅','shop':'たね屋','shipping':'出荷所','fish_market':'魚市場',
-               'general_store':'道具・雑貨屋','hall':'集会所','greenhouse':'温室',
-               'workshop':'衣装工房','cafe':'カフェ'}
-        name=names.get(self.interior,'建物')
-        self.overlay_panel(name+'  /  WALKABLE ROOM','WASDで室内を歩き、設備の近くでE。外へ出るときはEsc。')
-        # Room with a solid back-wall, a walkable wooden floor, and physical counters.
-        pygame.draw.rect(self.stage,(150,104,70),(239,162,804,406))
-        for j in range(6):
-            pygame.draw.rect(self.stage,(183,140+5*(j%2),101),(253,299+j*41,773,40))
-            pygame.draw.line(self.stage,(127,86,60),(254,301+j*41),(1022,301+j*41),2)
-        pygame.draw.rect(self.stage,(224,196,148),(252,177,773,113))
-        # Different fixtures per facility, displayed behind the walkable area.
-        if self.interior=='home':
-            pygame.draw.rect(self.stage,(98,64,56),(274,203,203,82),border_radius=5)
-            pygame.draw.rect(self.stage,(225,225,208),(284,211,181,65),border_radius=5)
-            pygame.draw.rect(self.stage,(249,239,205),(293,215,65,24),border_radius=4)
-        elif self.interior=='cafe':
-            for xx in (373,887):
-                pygame.draw.circle(self.stage,(103,72,55),(xx,260),44)
-                pygame.draw.circle(self.stage,(197,156,102),(xx,260),35)
-        elif self.interior=='hall':
-            pygame.draw.rect(self.stage,(107,69,53),(413,206,445,80),border_radius=5)
-            text(self.stage,self.fonts,'KABUBALL ARENA',(642,236),26,GOLD_LIGHT,True,True)
-        elif self.interior=='greenhouse':
-            for xx in range(318,983,94):
-                pygame.draw.rect(self.stage,(113,74,48),(xx,260,43,24))
-                pygame.draw.circle(self.stage,(78,133,73),(xx+21,250),23)
-        elif self.interior=='fish_market':
-            pygame.draw.rect(self.stage,(82,148,175),(334,211,594,75),border_radius=6)
-            for xx in range(359,914,97):pygame.draw.ellipse(self.stage,(203,222,206),(xx,231,55,19))
-        elif self.interior=='workshop':
-            for xx in range(323,986,91):
-                pygame.draw.rect(self.stage,OUTFIT_COLORS[(xx//91)%len(OUTFIT_COLORS)],(xx,215,35,67))
-        if self.interior in ('shop','shipping','general_store','workshop'):
-            for i in range(7):
-                xx=283+i*105
-                pygame.draw.rect(self.stage,(110,77,53),(xx,211,70,42))
-                pygame.draw.rect(self.stage,(203,178,121),(xx+6,217,58,30))
-        stations=STATIONS.get(self.interior,())
-        for i,st in enumerate(stations):
-            pygame.draw.rect(self.stage,(100,70,49),(int(st.x-48),int(st.y-14),96,29),border_radius=4)
-            pygame.draw.rect(self.stage,(220,183,116),(int(st.x-44),int(st.y-10),88,22),border_radius=4)
-            box(self.stage,(int(st.x-61),int(st.y-48),122,27),PAPER,BROWN,4,1)
-            text(self.stage,self.fonts,st.label,(int(st.x),int(st.y-46)),15,BROWN,True,True)
-        self.draw_scene_people(self.interior_pos)
-        nearby=room_nearby(self.interior,self.interior_pos)
-        if nearby:text(self.stage,self.fonts,'E : '+nearby.label,(642,580),19,GREEN_DARK,True,True)
-        else:text(self.stage,self.fonts,'カウンターの近くへ歩こう',(642,580),17,GREEN_DARK,False,True)
-        self.ui_button((445,607,176,47),'調べる [E]','interior_interact',size=16)
-        self.ui_button((647,607,176,47),'外へ出る','interior_exit',size=17)
+        self.draw_area_world()
 
-    def draw_scene_people(self,position):
+    def draw_neighbor_town(self):
+        self.draw_area_world()
+
+    def draw_area_world(self):
+        spec=SCENE_MAPS[self.area]
+        position=self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
+        self.camera=list(scene_camera(self.area,position,(BASE_W,VIEW_HEIGHT))) if self.area==NEIGHBOR else [0.,0.]
+        cx,cy=self.camera
+        world=self.world_layer
+        world.fill(DARK)
+        background=self.pixel_art.maps.get(spec.asset)
+        if background is not None:
+            if self.area==NEIGHBOR:
+                world.blit(background,(0,0),pygame.Rect(int(cx),int(cy),BASE_W,VIEW_HEIGHT))
+            else:
+                world.blit(self.pixel_art.room_views[spec.asset],(160,0))
+        else:
+            text(world,self.fonts,'マップ画像が見つかりません。更新用の画像を確認してください。',
+                 (120,200),20,CREAM,True)
+        if self.area=='room:home':
+            key=self.state.get('home_decor_selected','plant')
+            x,y=self.area_to_screen((700,520))
+            self.pixel_art.draw(world,key,(int(x),int(y),64,59))
+        self.draw_scene_people(position,world)
+        station=scene_nearby(self.area,position)
+        label=None
+        point=None
+        if self.area==NEIGHBOR and math.dist(position,NEIGHBOR_DOOR)<=92:
+            label='E : たね屋に入る';point=NEIGHBOR_DOOR
+        elif station:
+            label='E : '+station.label;point=(station.x,station.y)
+        elif at_exit(self.area,position):
+            label='E : みずほ町へ' if self.area==NEIGHBOR_STORE else 'E : 外へ出る'
+            point=position
+        if point:
+            x,y=self.area_to_screen(point);x=int(x);y=int(y-56)
+            width=max(160,min(310,self.fonts.get(17,True).size(label)[0]+28))
+            box(world,(x-width//2,y,width,32),DARK_2,GOLD,4,2)
+            text(world,self.fonts,label,(x,y+16),17,WHITE,True,True)
+        gate=spec.exit
+        ex,ey=self.area_to_screen((gate[0]+gate[2]/2,gate[1]+5))
+        ex,ey=int(ex),int(ey)
+        text(world,self.fonts,'みずほ町へ' if self.area==NEIGHBOR_STORE else '出口',
+             (ex,ey),15,WHITE,True,True)
+        self.stage.blit(world,(0,VIEW_TOP))
+        box(self.stage,(420,81,390,37),DARK_2,GOLD,5,2)
+        text(self.stage,self.fonts,spec.name,(615,99),21,CREAM,True,True)
+
+    def area_to_screen(self,point):
+        zoom=1. if self.area==NEIGHBOR else .75
+        offset=0 if self.area==NEIGHBOR else 160
+        return ((point[0]-self.camera[0])*zoom+offset,(point[1]-self.camera[1])*zoom)
+
+    def draw_scene_people(self,position,target=None):
+        target=self.world_layer if target is None else target
+        cx,cy=self.camera
         people=[(position[1],None)]
         people.extend((p.get('scene_y',ROOM_SPAWN[1]),p) for p in self.remote_players
                       if p.get('area')==self.area)
         for _,person in sorted(people,key=lambda row:row[0]):
             if person is None:
-                x,y=position
+                wx,wy=position
                 aid=self.state.get('avatar_id','original_girl')
                 ident='scene_local';name=self.state['player_name'];outfit=self.equipped_outfit()
             else:
-                x,y=person['scene_x'],person['scene_y']
+                wx,wy=person['scene_x'],person['scene_y']
                 aid=person.get('public_profile',{}).get('avatar_id','original_girl')
                 ident=person['id'];name=person['name'];outfit=person.get('public_profile',{}).get('outfit')
-            pygame.draw.ellipse(self.stage,(86,85,57),(int(x-15),int(y+10),30,9))
-            self.draw_avatar(self.stage,aid,0,x,y,(50,65),motion_key=ident,
-                             position=(x,y),area=self.area,outfit=outfit)
-            text(self.stage,self.fonts,name,(int(x),int(y-65)),14,BROWN,True,True)
+            x,y=self.area_to_screen((wx,wy))
+            if not -70<x<BASE_W+70 or not -70<y<VIEW_HEIGHT+70:continue
+            pygame.draw.ellipse(target,(86,85,57),(int(x-15),int(y+10),30,9))
+            size=(50,65) if self.area==NEIGHBOR else (38,49)
+            self.draw_avatar(target,aid,0,x,y,size,motion_key=ident,
+                             position=(wx,wy),area=self.area,outfit=outfit)
+            text(target,self.fonts,name,(int(x),int(y-size[1])),14,WHITE,True,True)
             if person and person.get('emote') in EMOTES and time.monotonic()<person.get('emote_local_until',0):
-                box(self.stage,(int(x-50),int(y-97),100,27),WHITE,BROWN,4,1)
-                text(self.stage,self.fonts,EMOTES[person['emote']],(int(x),int(y-94)),13,BROWN,True,True)
+                box(target,(int(x-50),int(y-97),100,27),WHITE,BROWN,4,1)
+                text(target,self.fonts,EMOTES[person['emote']],(int(x),int(y-94)),13,BROWN,True,True)
 
-    def draw_neighbor_town(self):
-        self.overlay_panel('となり町 / '+TOWN_NAME,'WASDで散策 / お店のカウンター近くでE / Tでチャット / Escで帰る')
-        pygame.draw.rect(self.stage,(131,174,111),(238,164,804,389))
-        for j in range(8):
-            pygame.draw.rect(self.stage,(206,184,143),(250,340+j*26,782,25))
-            pygame.draw.line(self.stage,(179,149,113),(251,339+j*26),(1031,339+j*26),1)
-        pygame.draw.rect(self.stage,(165,104,65),(325,181,620,126))
-        pygame.draw.rect(self.stage,(240,220,172),(338,196,594,104))
-        text(self.stage,self.fonts,'みずほ町のおみせ',(634,224),27,BROWN,True,True)
-        pygame.draw.rect(self.stage,BROWN,(576,286,122,23),border_radius=4)
-        text(self.stage,self.fonts,'たね屋  [E]',(637,262),17,BROWN,True,True)
-        for xx in (283,958):
-            pygame.draw.rect(self.stage,(113,77,50),(xx,283,17,40))
-            pygame.draw.circle(self.stage,GREEN_DARK,(xx+7,263),32)
-            pygame.draw.circle(self.stage,GREEN,(xx-4,251),22)
-        self.draw_scene_people(self.neighbor_pos)
-        near=math.dist(self.neighbor_pos,(637,300))<=100
-        text(self.stage,self.fonts,'E : お店を開く' if near else 'お店のカウンターへ歩こう',(640,578),19,GREEN_DARK,True,True)
-        self.ui_button((385,607,239,45),'お店を開く [E]','neighbor_shop',disabled=not near,size=17)
-        self.ui_button((655,607,239,45),'町から戻る','neighbor_exit',size=17)
+    def draw_area_map(self):
+        spec=SCENE_MAPS[self.area]
+        self.overlay_panel(spec.name+' / マップ','出口へ歩くと元のマップへ移動します。店や家具の近くではE。')
+        background=self.pixel_art.maps.get(spec.asset)
+        if background is None:return
+        rect=pygame.Rect(272,180,730,438)
+        self.stage.blit(pygame.transform.scale(background,rect.size),rect)
+        pos=self.neighbor_pos if self.area==NEIGHBOR else self.interior_pos
+        project=lambda point:(int(rect.x+point[0]/spec.size[0]*rect.w),int(rect.y+point[1]/spec.size[1]*rect.h))
+        pygame.draw.circle(self.stage,GOLD_LIGHT,project(pos),8)
+        pygame.draw.circle(self.stage,BROWN,project(pos),8,2)
+        for station in scene_stations(self.area):
+            text(self.stage,self.fonts,station.label,project((station.x,station.y)),14,WHITE,True,True)
 
     def draw_neighbor_shop(self):
         self.overlay_panel('みずほ町のたね屋','この町だけの品ぞろえ。買い物を終えたらEscで町に戻れます。')
@@ -3465,9 +3501,7 @@ class Game:
         b=arena.get('ball',{})
         if b:
             xx,yy=loc(b.get('x',480),b.get('y',270))
-            pygame.draw.circle(self.stage,(232,226,194),(xx,yy),11)
-            pygame.draw.circle(self.stage,(82,137,73),(xx+3,yy-5),4)
-            pygame.draw.circle(self.stage,BROWN,(xx,yy),11,2)
+            self.assets.draw_crop(self.stage,'kabu',(xx-13,yy-14,26,28))
         score=arena.get('scores',[0,0]);remain=int(arena.get('remaining',180))
         key=(arena.get('id'),tuple(score))
         if self.arena_last_score_key is not None and key[0]==self.arena_last_score_key[0] and key[1]!=self.arena_last_score_key[1]:
@@ -3548,6 +3582,7 @@ class Game:
         text(self.stage,self.fonts,'※ 隣町では限定の種を購入できます。オンラインではホストが購入を検証します。',(637,635),15,BROWN,False,True)
 
     def draw_map(self):
+        if self.area!=OUTDOOR:self.draw_area_map();return
         self.overlay_panel('拡大マップ  /  MAP','現在地と主要施設を確認できます。Escで戻ります。')
         r=pygame.Rect(268,171,743,417)
         pygame.draw.rect(self.stage,(166,194,122),r,border_radius=5)
@@ -3662,7 +3697,7 @@ class Game:
         self.ui_button((492,615,296,44),'今すぐセーブ','save',size=18)
 
     def draw_help(self):
-        self.overlay_panel('遊び方・データ管理','マップと各施設は今回の新規仮実装です。元デザインを再現したものではありません。')
+        self.overlay_panel('遊び方・データ管理','施設と隣町は独立したマップです。入口でE、出口へ歩くと元の場所に戻ります。')
         lines=[
             'WASD / 矢印：歩く　　E / Space：調べる・植える・収穫する',
             'I / Tab：持ち物・並べ替え　 M：ミッション　 F9：緊急脱出　 T：チャット',
@@ -3822,7 +3857,8 @@ class Game:
         self.buttons.clear()
         if self.scene=='title':self.draw_title()
         else:
-            self.draw_world()
+            if self.area==OUTDOOR:self.draw_world()
+            else:self.draw_area_world()
             self.hud()
         if self.modal:
             self.buttons.clear()
@@ -3872,6 +3908,10 @@ class Game:
             elif self.modal=='fishing_result':self.draw_fishing_result()
             elif self.modal=='fish_market':self.draw_fish_market()
             elif self.modal=='story':self.draw_story()
+        if self.scene=='world' and time.monotonic()-self.warp_started<.35:
+            shade=pygame.Surface((BASE_W,VIEW_HEIGHT),pygame.SRCALPHA)
+            shade.fill((0,0,0,round(220*(1-(time.monotonic()-self.warp_started)/.35))))
+            self.stage.blit(shade,(0,VIEW_TOP))
         self.apply_brightness()
         if self.screen.get_size()==(BASE_W,BASE_H):
             self.screen.blit(self.stage,(0,0))
@@ -3882,8 +3922,9 @@ class Game:
     def update_gameplay(self,dt,now=None):
         now=time.monotonic() if now is None else now
         if self.scene=='world' and self.modal=='fishing':self.update_fishing(dt)
-        if self.scene=='world' and self.modal is None:self.move(dt)
-        if self.scene=='world' and self.modal in ('interior','neighbor_town'):self.move_in_area(dt)
+        if self.scene=='world' and self.modal is None:
+            if self.area==OUTDOOR:self.move(dt)
+            else:self.move_in_area(dt)
         if self.online_client:
             self.poll_network()
             self.interpolate_remote_positions(dt)
@@ -3928,6 +3969,8 @@ def main():
                 raise RuntimeError('Missing character images')
             if len(probe.avatar_atlas.frames)!=len(AVATARS)*16:
                 raise RuntimeError('Missing directional walking sprites')
+            if not probe.pixel_art.complete():
+                raise RuntimeError('Missing pixel-art map or scenery assets')
             if len(probe.item_icons)!=3:
                 raise RuntimeError('Missing consumable sprites')
             probe.render()  # title screen
@@ -3938,9 +3981,12 @@ def main():
                 probe.enter_area('room:'+place)
                 probe.render()  # catches missing room labels and UI mapping
             probe.enter_area(OUTDOOR)
+            probe.enter_area(NEIGHBOR);probe.render()
+            probe.enter_area(NEIGHBOR_STORE);probe.render()
+            probe.enter_area(OUTDOOR)
             for modal in ('chest','travel','map','shop','inventory','daily_board',
                           'login_bonus','notifications','decor','social','hud_settings','progression',
-                          'profile','mail','friends','event','avatars','save_slots','neighbor_town',
+                          'profile','mail','friends','event','avatars','save_slots',
                           'neighbor_shop','arena','duel','fishing_wait'):
                 probe.modal=modal
                 probe.render()  # new screens, map and storage buttons

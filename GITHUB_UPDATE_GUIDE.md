@@ -1,24 +1,39 @@
-# v9.3.0 更新手順
+# v9.4.0 更新手順
 
-1. `AmberaFarm_v9_3_0_Root_Upload.zip` を展開し、中のファイルを GitHub の main 直下へアップロードしてコミット。
-2. `AmberaFarm_v9_3_0_Tests_Upload.zip` を展開し、中のファイルを `tests` フォルダへアップロードしてコミット。
-3. `AmberaFarm_v9_3_0_Avatars_Upload.zip` を展開し、歩行画像7枚を `assets/avatars` へ追加してコミット。以前の表情画像28枚はそのまま使用します。
-4. 3つを反映してから Actions の **Build Ambera Farm Windows EXE → Run workflow → main** を実行。
+対象: https://github.com/AnberaForm/AmberaFarm
 
-`version.json` は **9.3.0**。今回のリリースタグは **v9.3.0** を使用します。
-ソースの変更と画像の追加を済ませてからビルドします。
+今回は素材とプログラムの両方が必要です。3つのZIPを反映してからActionsを実行してください。
 
-ActionsはPythonのテストに加え、生成したWindows EXEで112コマの読み込み、画面表示、キー入力、CPU移動、シュートのスモークテストを行います。
+| ZIP | GitHubで開く場所 | アップロード内容 |
+| --- | --- | --- |
+| AmberaFarm_v9_4_0_Root_Upload.zip | main直下 | 展開した中身を、dataやtoolsのフォルダ構成を保ってアップロード |
+| AmberaFarm_v9_4_0_Tests_Upload.zip | testsフォルダ | 展開したテストファイルをアップロード |
+| AmberaFarm_v9_4_0_Assets_Upload.zip | main直下 | 展開したassetsフォルダを丸ごとアップロード |
 
-タグのビルドでは次の配布ファイルを生成する既存の仕組みを利用します。
+AssetsのZIPは、先頭に `assets/` がある構成です。GitHubのassetsフォルダの中へそのまま入れると `assets/assets/` になるため、main直下へアップロードしてください。ブラウザで複数回に分けてアップロードしても構いません。
 
-- `AmberaFarm_Windows_v9.3.0.zip`
-- `AmberaFarm_payload_v9.3.0.zip`
+今回のRootにはv9.3.0で追加したモジュールも、Assetsには既存の歩行画像も含めています。v9.3.0が未反映の場合も、この3つをすべて反映してください。
+
+`AmberaFarm_v9_4_0_GitHub_Update_Files.zip` は3つを正しいフォルダ位置へまとめた統合版です。gitで反映するときや、フォルダ構成を保って更新できる場合に利用できます。ブラウザではファイル数を分けられる上記3つが扱いやすい構成です。
+
+`AmberaFarm_v9_4_0_FullSource.zip` はワークフローや過去の説明を含む全ソースのバックアップです。プレイヤー向けWindows実行ファイルは含みません。
+
+## Actionsとリリース
+
+1. Actionsの「Build Ambera Farm Windows EXE」をmainで実行。
+2. テスト・Windowsビルド・EXEの起動テストが成功することを確認。
+3. リリースタグを `v9.4.0` にします。`version.json` は `9.4.0` です。
+4. タグのActionsでも成功し、以下の3ファイルが生成されたことを確認します。
+
+- `AmberaFarm_Windows_v9.4.0.zip`
+- `AmberaFarm_payload_v9.4.0.zip`
 - `update_manifest.json`
 
-この作成環境ではWindows EXEはビルドしていません。Actionsの成功後、Windowsでキャラ移動・カブボール・釣りと、別PCとのオンラインプレイを確認してください。
+## 遊ぶときの確認
 
-`AmberaFarm_v9_3_0_FullSource.zip` はすべてのソースと画像を含む、バックアップ・開発・Python実行向けの一式です。
-`AmberaFarm_v9_3_0_GitHub_Update_Files.zip` はフォルダ構成を維持した統合差分です。上記の分割3ファイルとゲームの変更内容は同じです。追加のプレビュー生成スクリプトは `tools` に入っていますが、ゲーム起動には不要です。
-
-オンラインの通信プロトコルは12。参加者全員を同じ版へ更新してください。セーブの初期化は不要です。
+- 自宅と温室で、室内が牧場画面へのダイアログではなく独立したゲームマップになる。
+- WASDで歩き、家具やカウンターの近くでEを押して使う。
+- 下の出口へ歩くと、入る前の入口付近へ戻る。
+- 隣町のたね屋へ入り、買い物の後は店内 → 隣町 → アンベラ町と戻れる。
+- Escでメニュー、バッグを閉じた後も同じマップに留まる。
+- オンラインでは参加者全員をv9.4.0に揃える。
