@@ -24,7 +24,7 @@ ALLOWED={
     'v8_features.py','player_movement.py','inventory_grid.py','profile_progress.py',
     'life_hub.py','town_features.py','coop_orders.py','farm_mailbox.py','notices.py',
     'kabuball_core.py','character_avatars.py','avatar_animation.py','area_world.py',
-    'interior_world.py','neighbor_town.py','save_slots.py','story_admin_auth.py','scene_maps.py','pixel_art.py',
+    'interior_world.py','neighbor_town.py','save_slots.py','story_admin_auth.py','scene_maps.py','pixel_art.py','asset_layout.py',
     'START_GAME.cmd','DIAGNOSE.cmd','START_STORY_EDITOR.cmd','BUILD_EXE.cmd',
     'requirements.txt','data/story_events.json','data/announcements.json','data/mail_campaigns.json',
     *{'assets/crops/'+name+'.png' for name in (

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from asset_layout import require_pixel_assets
 
 BASE = Path(__file__).resolve().parent
 
@@ -13,6 +14,8 @@ BASE = Path(__file__).resolve().parent
 def build(destination=None):
     if os.name != 'nt':
         raise RuntimeError('Windows EXE files must be built on Windows (or GitHub Actions windows-latest).')
+    recovered = require_pixel_assets(BASE)
+    print(f'Pixel asset layout ready: 12/12 images; recovered {len(recovered)} files.', flush=True)
     destination = Path(destination or BASE / 'build_output').resolve()
     destination.mkdir(parents=True, exist_ok=True)
     work = destination / 'pyinstaller_work'

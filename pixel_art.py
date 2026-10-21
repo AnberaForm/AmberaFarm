@@ -2,6 +2,7 @@
 """Generated PNG maps and sprite atlases; nearest-neighbor display only."""
 from pathlib import Path
 import pygame
+from asset_layout import restore_pixel_assets
 from scene_maps import MAPS
 
 PROPS = ('tree', 'fountain', 'quest_board', 'carriage',
@@ -18,6 +19,7 @@ PROP_REGIONS = ((25,52,284,320), (345,105,286,260), (649,79,257,266), (929,114,3
 class PixelArt:
     def __init__(self, root):
         self.project_root = Path(root)
+        self.restored_assets = restore_pixel_assets(self.project_root)
         root = self.project_root/'assets'
         self.maps = {}
         self.room_views = {}
@@ -74,6 +76,8 @@ class PixelArt:
         expected = len({spec.asset for spec in MAPS.values()})
         lines = [f'Pixel-art assets: backgrounds {len(self.maps)}/{expected}, '
                  f'sprites {len(self.sprites)}/{len(PROPS)+len(FISH_IDS)}']
+        if self.restored_assets:
+            lines.append(f'Recovered {len(self.restored_assets)} flattened image uploads into assets/scenes and assets/scenery.')
         for relative, reason in sorted(self.asset_errors.items()):
             lines.append(f'  {relative}: {reason}')
             # Point out common upload layouts without accepting wrong paths.

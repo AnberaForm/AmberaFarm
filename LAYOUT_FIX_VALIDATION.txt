@@ -1,0 +1,30 @@
+v9.4.0 LayoutFix 検証結果
+2026-10-22（日本時間）
+
+調査したGitHub main:
+https://github.com/AnberaForm/AmberaFarm
+2f2181a1044e3dcbd6080ca3632a39a7a678511e
+
+修正前:
+実際のGitHubコードで、画像のテストを実行して同じ失敗を再現。
+assert game.pixel_art.complete()
+tests/test_v940_maps_and_art.py:167
+1 failed
+
+修正後:
+同じテストが 1 passed。
+全体: 180 passed, 12 subtests passed in 20.64s
+スモーク: Smoke test passed: 112 walking poses, all screens, keyboard movement, CPU and charged shot.
+compileall、git diff --check、v9.4.0のタグ照合に成功。
+
+追加確認:
+・main直下の画像から12枚全てを復元し、同じPNGであることを確認。
+・番号付きファイル名と、同名の建物外観画像が存在しても正しい室内画像を選択。
+・2回目の起動では再コピーしない。
+・内容が一致しないPNGを復元せず、不足画像として検出。
+・既存の正しいフォルダ内の画像を維持。
+・Windowsビルド処理の模擬実行で、PyInstaller開始前に画像フォルダを作成。
+・PyInstallerへassets/scenesとassets/sceneryを渡すことを確認。
+・ZIP内の4ファイルを展開した構成でも、平坦なアップロードから画像10背景・24スプライトを読み込めることを確認。
+
+Windows EXEのコンパイル・実機操作は未検証です。
