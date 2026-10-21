@@ -29,6 +29,7 @@ from farm_mailbox import load as load_public_mail
 from v8_features import (field_action, buy_consumable, use_consumable, init_v8, restore_stamina,
                          exchange_event, new_outfit, OUTFIT_COLORS, receive_public_mail)
 from town_features import move_chest, rest_in_bed
+from player_movement import walkable_short_path, path_is_clear
 from coop_orders import new_board, view as board_view, contribute as contribute_order
 from kabuball_core import KabuballMatch
 from profile_progress import (init_profile, public_profile, refresh_progress,
@@ -37,7 +38,7 @@ from profile_progress import (init_profile, public_profile, refresh_progress,
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 7
+PROTOCOL = 9
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -136,7 +137,7 @@ class RoomServer:
                             x, y = SPAWN
                         parent.players[pid] = {
                             'id': pid, 'name': safe_name(hello.get('name')),
-                            'x': x, 'y': y, 'last': time.monotonic(),
+                            'x': x, 'y': y, 'last': time.monotonic(), 'move_seq': -1, 'move_step_seq': 0,
                             'profile': profile, 'last_chat': 0., 'last_rescue': 0.,
                             'uid':profile['player_uid'],
                         }
@@ -154,6 +155,7 @@ class RoomServer:
                     seen_world_revision = -1
                     last_position_hash = None
                     last_position_sent = 0.
+                    last_ack_seq = -1
                     while True:
                         now = time.monotonic()
                         packets = []
@@ -182,6 +184,8 @@ class RoomServer:
                                                      public_profile=public_profile(member['profile']))
                                                 for member in parent.players.values()],
                                     'self_pos': [player['x'], player['y']],
+                                    'move_seq': player['move_seq'],
+                                    'move_step_seq': player['move_step_seq'],
                                     'chat': list(parent.chat_log[-30:]),
                                 })
                                 last_state = now
@@ -191,17 +195,21 @@ class RoomServer:
                                 positions = tuple((key, round(member['x'], 2), round(member['y'], 2))
                                                   for key, member in parent.players.items())
                                 arena_running=parent.arena_view(pid) and parent.arena_view(pid)['status']=='active'
-                                if positions != last_position_hash or now - last_position_sent >= 1.0 or arena_running:
+                                if (positions != last_position_hash or now - last_position_sent >= 1.0
+                                        or player['move_seq'] != last_ack_seq or arena_running):
                                     packets.append({
                                         'type': 'positions',
                                         'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid')},
                                                          public_profile=public_profile(member['profile']))
                                                     for member in parent.players.values()],
                                         'self_pos': [player['x'], player['y']],
+                                        'move_seq': player['move_seq'],
+                                    'move_step_seq': player['move_step_seq'],
                                         'arena': parent.arena_view(pid),
                                     })
                                     last_position_hash = positions
                                     last_position_sent = now
+                                    last_ack_seq = player['move_seq']
                                 last_positions = now
                             # Chat is a separate, tiny and prompt message.
                             if parent.chat_seq > last_chat_seq and now - last_chat >= CHAT_INTERVAL:
@@ -300,22 +308,78 @@ class RoomServer:
         self.chat_log = self.chat_log[-30:]
 
     def _move(self, pid, data):
+        """Accept frame-by-frame validated trails, not a blind line from A to B.
+
+        The writer coalesces 12Hz movement packets. Under network lag, the old
+        endpoint-only validation could reject a completely legal route around
+        a building. Trail steps have monotonic IDs and are replayed only until
+        acknowledged; the server validates every segment and cumulative speed.
+        """
         p = self.players[pid]
-        try:
-            x = float(data.get('x'))
-            y = float(data.get('y'))
-            if not math.isfinite(x) or not math.isfinite(y):
+        seq = data.get('seq')
+        if type(seq) is int and 0 <= seq <= 2_147_483_647:
+            if seq <= p['move_seq']:
                 return
-        except (ValueError, TypeError):
+            p['move_seq'] = seq  # ACK invalid or rejected moves too.
+        try:
+            x, y = float(data.get('x')), float(data.get('y'))
+            if not (math.isfinite(x) and math.isfinite(y)):
+                return
+        except (ValueError, TypeError, OverflowError):
             return
         now = time.monotonic()
-        elapsed = max(.01, min(2., now - p['last']))
-        distance = math.dist((x, y), (p['x'], p['y']))
-        if distance > max(38, 280 * elapsed) or not can_stand(x, y):
+        elapsed = max(.01, min(1.5, now - p['last']))
+        allowed_distance = max(23., 205. * elapsed * 1.35 + 9.)
+        start = (p['x'], p['y'])
+
+        if 'path' in data:
+            path = data['path']
+            if not isinstance(path, list) or len(path) > 144:
+                return
+            last_id = p.get('move_step_seq', 0)
+            new_steps = []
+            previous_id = -1
+            for point in path:
+                if (not isinstance(point, (list, tuple)) or len(point) != 3
+                        or type(point[0]) is not int or not 0 <= point[0] <= 2_147_483_647
+                        or point[0] <= previous_id):
+                    return
+                previous_id = point[0]
+                if point[0] <= last_id:
+                    continue
+                try:
+                    sx, sy = float(point[1]), float(point[2])
+                except (TypeError, ValueError, OverflowError):
+                    return
+                if not (math.isfinite(sx) and math.isfinite(sy)):
+                    return
+                new_steps.append((point[0], sx, sy))
+            if not new_steps:
+                return
+            # The last frame must be the destination, so the path itself cannot
+            # conceal an unchecked extra teleport at the end.
+            if math.dist((new_steps[-1][1], new_steps[-1][2]), (x, y)) > .035:
+                return
+            cursor = start
+            travelled = 0.0
+            for _, sx, sy in new_steps:
+                nxt = (sx, sy)
+                delta = math.dist(cursor, nxt)
+                travelled += delta
+                # Individual 60Hz render steps are normally ~3.5 px. 15px
+                # tolerates frame stalls while forbidding arbitrary jumps.
+                if (delta > 15.0 or not walkable_short_path(cursor, nxt, max_length=15.0)
+                        or travelled > allowed_distance):
+                    return
+                cursor = nxt
+            p.update(x=cursor[0], y=cursor[1], last=now,
+                     move_step_seq=new_steps[-1][0])
             return
-        steps = max(1, math.ceil(distance / 6))
-        if any(not can_stand(p['x'] + (x-p['x'])*i/steps, p['y'] + (y-p['y'])*i/steps)
-               for i in range(1, steps + 1)):
+
+        # Keep the old validator for direct unit tests and legacy internal
+        # callers. Network peers use PROTOCOL 9 and always send a trail.
+        if (math.dist(start, (x,y)) > allowed_distance or not can_stand(x,y)
+                or not walkable_short_path(start, (x,y), max_length=allowed_distance)):
             return
         p.update(x=x, y=y, last=now)
 
@@ -790,6 +854,10 @@ class RoomClient:
                     self.sock.sendall(pack({'type': 'ping', 'nonce': last_ping}))
         except OSError:
             self.active = False
+
+    def clear_unsent_movement(self):
+        with self.move_lock:
+            self.latest_move = None
 
     def send(self, kind, **kwargs):
         if not self.active:

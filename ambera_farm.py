@@ -42,7 +42,8 @@ from world_map import (BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, 
                        path_at, plaza_at, flower_at, district_at, TRAVEL_STOPS, nearest_travel_stop, blocked as map_blocked,
                        can_stand, plot_world as map_plot_world)
 from multiplayer import RoomServer, RoomClient, PORT
-from player_movement import move_character, safe_destination
+from player_movement import (move_character, safe_destination, walkable_short_path,
+                             reconcile_prediction, MovementTrail, interpolate_around_obstacles)
 from updater import current_version, get_config, fetch_manifest
 from notices import (load_offline, fetch_public, load_seen, mark_seen,
                      public_view, unread_count, RELEASES_URL)
@@ -502,6 +503,10 @@ class Game:
         self.room_pin = ''
         self.last_network_pos = 0
         self.remote_targets = {}
+        self.move_seq = 0
+        self.sent_move_positions = {}
+        self.movement_trail = MovementTrail()
+        self.last_move_ack = -1
         self.display_fps = 0.0
         self.show_performance = False
         self.join_fields = {'address':'127.0.0.1:47821','pin':'','name':self.state['player_name']}
@@ -716,6 +721,7 @@ class Game:
             self.online_client=RoomClient(self.join_fields['address'].strip(),self.join_fields['pin'],self.join_fields['name'],profile=self.state)
             self.online_guest=True
             self.player=list(self.online_client.spawn)
+            self.movement_trail.clear()
             self.room_pin=self.join_fields['pin']
             self.scene='world';self.modal=None
             self.say('オンライン参加！ 畑は共有、お金・所持品・ミッションは個人別です。 Tでチャット',11)
@@ -777,6 +783,10 @@ class Game:
         self.online_guest = False
         self.remote_players = []
         self.remote_targets = {}
+        self.move_seq = 0
+        self.sent_move_positions.clear()
+        self.movement_trail.clear()
+        self.last_move_ack = -1
         self.room_pin = ''
         self.chat_log = []
         self.chat_last_seq = 0
@@ -822,26 +832,39 @@ class Game:
             target = self.remote_targets.get(player['id'])
             if target is None:
                 continue
-            dx, dy = target[0] - player['x'], target[1] - player['y']
-            if dx * dx + dy * dy > 160**2:
-                player['x'], player['y'] = target
-            else:
-                player['x'] += dx * factor
-                player['y'] += dy * factor
+            player['x'], player['y'] = interpolate_around_obstacles(
+                (player['x'], player['y']), target, factor)
 
-    def sync_position(self, server_position):
-        if (not isinstance(server_position, list) or len(server_position) != 2
+    def sync_position(self, server_position, move_seq=None, move_step_seq=None):
+        """Reconcile only an acknowledged frame, not an old position update.
+
+        A rejected path must abandon its speculative unacknowledged history.
+        Continuing to resend that history recreated wall collisions forever.
+        """
+        if (not isinstance(server_position, (list, tuple)) or len(server_position) != 2
+                or not all(isinstance(v, (int, float)) and math.isfinite(v)
+                           for v in server_position)
                 or not can_stand(*server_position)):
             return
-        delta = [server_position[i] - self.player[i] for i in (0, 1)]
-        distance = math.hypot(*delta)
-        if 14 < distance < 650:
-            step = min(5.0, distance * .07)
-            candidate = [self.player[i] + delta[i] / distance * step for i in (0, 1)]
-            if can_stand(*candidate):
-                self.player = candidate
-        elif distance >= 650:
-            self.say('通信位置にズレがあります。F9で安全に位置を修正できます。', 5)
+        if type(move_seq) is not int or move_seq <= self.last_move_ack:
+            return
+        sent = self.sent_move_positions.get(move_seq)
+        if sent is None:
+            return
+        self.last_move_ack = move_seq
+        for seq in list(self.sent_move_positions):
+            if seq <= move_seq:
+                del self.sent_move_positions[seq]
+        self.movement_trail.acknowledge(move_step_seq)
+        # Minor differences are normal due to per-packet rounding.
+        # For a truly rejected move, reset the local prediction and the path
+        # buffer rather than predicting from an impossible position forever.
+        if math.dist(sent, server_position) > 3.0:
+            self.player = list(server_position)
+            self.movement_trail.clear()
+            self.sent_move_positions.clear()
+            if self.online_client:
+                self.online_client.clear_unsent_movement()
 
     def receive_chat(self, messages, replace=False):
         if not isinstance(messages, list):
@@ -881,7 +904,8 @@ class Game:
                     self.coop_board=packet.get('coop_board',self.coop_board)
                     self.friend_invites=packet.get('friend_invites',[])
                     self.update_remote_positions(packet.get('players', []))
-                    self.sync_position(packet.get('self_pos'))
+                    self.sync_position(packet.get('self_pos'), packet.get('move_seq'),
+                                       packet.get('move_step_seq'))
                     self.receive_chat(packet.get('chat', []), replace=True)
                 except (KeyError, TypeError, ValueError):
                     pass
@@ -890,7 +914,8 @@ class Game:
                 self.arena_state=packet.get('arena',self.arena_state)
                 if self.arena_state and self.arena_state.get('status')=='active' and self.modal in ('arena','arena_match'):
                     self.modal='arena_match'
-                self.sync_position(packet.get('self_pos'))
+                self.sync_position(packet.get('self_pos'), packet.get('move_seq'),
+                                       packet.get('move_step_seq'))
             elif packet.get('type') == 'chat_delta':
                 self.receive_chat(packet.get('chat', []))
             elif packet.get('type') == 'result':
@@ -899,6 +924,9 @@ class Game:
                         and all(isinstance(x,(int,float)) and math.isfinite(x) for x in warp)
                         and can_stand(*warp)):
                     self.player=list(warp)
+                    self.sent_move_positions.clear()
+                    self.movement_trail.clear()
+                    self.last_move_ack = self.move_seq
                 self.duel_state=packet.get('duel',self.duel_state)
                 self.arena_state=packet.get('arena',self.arena_state)
                 self.arena_leaders=packet.get('leaderboard',self.arena_leaders)
@@ -924,7 +952,13 @@ class Game:
         if not self.online_client:
             return
         if time.monotonic() - self.last_network_pos >= 1.0 / 12.0:
-            self.online_client.send('move', x=round(self.player[0], 2), y=round(self.player[1], 2))
+            self.move_seq += 1
+            self.sent_move_positions[self.move_seq] = tuple(self.player)
+            if len(self.sent_move_positions) > 180:
+                del self.sent_move_positions[next(iter(self.sent_move_positions))]
+            self.online_client.send('move', x=round(self.player[0], 2),
+                                    y=round(self.player[1], 2), seq=self.move_seq,
+                                    path=self.movement_trail.packet_path())
             self.last_network_pos = time.monotonic()
         if self.online_guest and time.monotonic() - self.last_guest_save >= 12:
             self.save_guest_profile(True)
@@ -937,6 +971,9 @@ class Game:
             return
         self.last_rescue = now
         self.player = safe_destination()
+        self.sent_move_positions.clear()
+        self.movement_trail.clear()
+        self.last_move_ack = self.move_seq
         if self.online_client:
             self.online_client.action('rescue', None)
             self.say('緊急脱出を要求しました。ホストの位置情報と同期します。', 5)
@@ -1086,7 +1123,10 @@ class Game:
         if dx == dy == 0:
             return
         self.facing = ('right' if dx > 0 else 'left') if abs(dx) > abs(dy) else ('down' if dy > 0 else 'up')
-        self.player = move_character(self.player, (dx, dy), dt)
+        after = move_character(self.player, (dx, dy), dt)
+        if after != self.player and self.online_client:
+            self.movement_trail.append(after)
+        self.player = after
 
     def near(self,point,radius):
         return math.dist(self.player,point)<=radius
