@@ -103,170 +103,201 @@ def create_release(version, notes):
 
 class NoticeAdminTab:
     def __init__(self, parent):
-        self.parent = parent
-        self.feed = load_draft()
-        self.index = None
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
-        ttk.Label(parent, text='お知らせ管理 — 保存してからGitHubへ公開',
-                  font=('Meiryo', 13, 'bold')).grid(row=0, column=0, sticky='w', pady=(3, 8))
-        ttk.Label(parent, text='公開した文章は、ゲームのEXE更新なしでプレイヤーへ届きます。GitHub CLIの認証が必要。',
-                  foreground='#555555').grid(row=1, column=0, sticky='w')
-        body = ttk.Panedwindow(parent, orient='horizontal')
-        body.grid(row=2, column=0, sticky='nsew', pady=(9, 0))
-        left = ttk.Frame(body); right = ttk.Frame(body, padding=(10, 0))
-        body.add(left, weight=1); body.add(right, weight=3)
-        self.list = tk.Listbox(left, font=('Meiryo', 10), exportselection=False)
-        self.list.pack(fill='both', expand=True)
-        self.list.bind('<<ListboxSelect>>', self.choose)
-        row = ttk.Frame(left); row.pack(fill='x', pady=8)
-        ttk.Button(row, text='追加', command=self.add).pack(side='left', padx=3)
-        ttk.Button(row, text='削除', command=self.delete).pack(side='left', padx=3)
-        self.id_v = tk.StringVar(); self.title_v = tk.StringVar()
-        self.category_v = tk.StringVar(value='news'); self.date_v = tk.StringVar()
-        self.published_v = tk.BooleanVar(value=True); self.pinned_v = tk.BooleanVar()
-        self.url_v = tk.StringVar(value=RELEASES_URL)
-        def field(name, var):
-            ttk.Label(right, text=name).pack(anchor='w', pady=(5, 1))
-            ttk.Entry(right, textvariable=var).pack(fill='x')
-        field('お知らせID（英数字、公開後は変更しない）', self.id_v)
-        field('タイトル', self.title_v)
-        ttk.Label(right, text='種類').pack(anchor='w', pady=(5, 1))
-        ttk.Combobox(right, textvariable=self.category_v, values=list(TYPES), state='readonly').pack(fill='x')
-        field('公開日（表示用）', self.date_v)
-        field('配布リンク（公式GitHub Releasesのみ）', self.url_v)
-        flags = ttk.Frame(right); flags.pack(fill='x', pady=6)
-        ttk.Checkbutton(flags, text='公開する', variable=self.published_v).pack(side='left')
-        ttk.Checkbutton(flags, text='重要なお知らせ（上部固定）', variable=self.pinned_v).pack(side='left', padx=15)
-        ttk.Label(right, text='本文（1800文字以内）').pack(anchor='w')
-        self.body = tk.Text(right, height=10, wrap='word', font=('Meiryo', 10))
-        self.body.pack(fill='both', expand=True)
-        footer = ttk.Frame(parent); footer.grid(row=3, column=0, sticky='ew', pady=10)
-        ttk.Button(footer, text='編集中の内容を反映', command=self.apply).pack(side='left', padx=3)
-        ttk.Button(footer, text='下書き保存', command=self.save).pack(side='left', padx=3)
-        ttk.Button(footer, text='GitHubへ公開', command=self.publish).pack(side='right', padx=3)
-        ttk.Button(footer, text='GitHubから読み込む', command=self.import_remote).pack(side='right', padx=3)
+        import copy
+        from admin_ui import heading, ScrollForm, field, Choice, list_area, text_area, TaskRunner
+        self.parent=parent;self.feed=load_draft();self.saved=copy.deepcopy(self.feed);self.index=None
+        self.baseline=None;self.loading=False
+        self.status=tk.StringVar(value='ローカル下書きを読み込みました')
+        self.task=TaskRunner(parent,self.status)
+        heading(parent,'お知らせ','1. 編集 → 2. 下書き保存 → 3. プレビュー → 4. GitHubへ公開。下書きだけではプレイヤーに届きません。')
+        footer=ttk.Frame(parent);footer.pack(side='bottom',fill='x',pady=(12,0))
+        self.actions=[]
+        for title,callback,style in [('GitHubへ公開',self.publish,'Primary.TButton'),('下書き保存',self.save,'TButton'),('プレビュー',self.preview,'TButton')]:
+            button=ttk.Button(footer,text=title,command=callback,style=style);button.pack(side='right',padx=3);self.actions.append(button)
+        ttk.Label(parent,textvariable=self.status,style='Muted.TLabel',wraplength=780).pack(side='bottom',anchor='w',pady=(8,0))
+        body=ttk.Panedwindow(parent,orient='horizontal');body.pack(fill='both',expand=True)
+        left=ttk.Frame(body,width=270);scroll=ScrollForm(body);body.add(left,weight=1);body.add(scroll,weight=3);right=scroll.content
+        self.query=tk.StringVar();ttk.Entry(left,textvariable=self.query).pack(fill='x',pady=(0,6))
+        ttk.Label(left,text='タイトル・種類・IDで検索',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
+        self.list=list_area(left);self.list.bind('<<ListboxSelect>>',self.choose)
+        row=ttk.Frame(left);row.pack(fill='x',pady=8)
+        for text,cb in [('追加',self.add),('削除',self.delete)]:
+            button=ttk.Button(row,text=text,command=cb);button.pack(side='left',padx=3);self.actions.append(button)
+        button=ttk.Button(left,text='公開情報を読み込む',command=self.import_remote);button.pack(fill='x');self.actions.append(button)
+        self.id_v=tk.StringVar();self.title_v=tk.StringVar();self.category_v=tk.StringVar(value='news');self.date_v=tk.StringVar()
+        self.published_v=tk.BooleanVar();self.pinned_v=tk.BooleanVar();self.url_v=tk.StringVar(value=RELEASES_URL)
+        field(right,'タイトル',self.title_v)
+        ttk.Label(right,text='種類').pack(anchor='w',pady=(9,4));Choice(right,self.category_v,TYPE_LABELS)
+        field(right,'公開日（表示用）',self.date_v)
+        flags=ttk.LabelFrame(right,text='公開する内容');flags.pack(fill='x',pady=12)
+        ttk.Checkbutton(flags,text='公開対象にする（送信は「GitHubへ公開」から）',variable=self.published_v).pack(anchor='w')
+        ttk.Checkbutton(flags,text='重要なお知らせとして上部に表示',variable=self.pinned_v).pack(anchor='w',pady=(7,0))
+        ttk.Label(right,text='本文（1800文字まで）').pack(anchor='w',pady=(9,4));self.body=text_area(right,height=8)
+        self.counter=tk.StringVar();ttk.Label(right,textvariable=self.counter,style='Muted.TLabel').pack(anchor='e')
+        field(right,'配布リンク（公式GitHub Releases）',self.url_v);field(right,'お知らせID（公開後は変更しない）',self.id_v)
+        self.query.trace_add('write',lambda *args:self.refresh())
+        for var in (self.id_v,self.title_v,self.category_v,self.date_v,self.url_v,self.published_v,self.pinned_v):var.trace_add('write',self.changed)
+        self.body.bind('<<Modified>>',self.body_changed)
         self.refresh()
-        if self.feed['notices']:
-            self.list.selection_set(0); self.choose()
+        if self.feed['notices']:self.load(0)
+
+    def values(self):
+        return tuple(v.get() for v in (self.id_v,self.title_v,self.category_v,self.date_v,self.url_v,self.published_v,self.pinned_v))+(self.body.get('1.0','end-1c'),)
+
+    def has_changes(self):
+        return self.feed!=self.saved or (self.index is not None and self.baseline is not None and self.values()!=self.baseline)
+
+    def changed(self,*args):
+        if self.loading:return
+        self.counter.set(f'{len(self.body.get("1.0","end-1c"))} / 1800文字')
+        self.status.set('未保存の変更があります' if self.has_changes() else '下書き保存済み / 公開は別操作です')
+
+    def body_changed(self,event=None):
+        if self.body.edit_modified():self.changed();self.body.edit_modified(False)
 
     def refresh(self):
-        self.list.delete(0, 'end')
-        for n in self.feed['notices']:
-            flag = '公開' if n['published'] else '下書き'
-            self.list.insert('end', f'[{flag}] {n["title"]}')
+        self.list.delete(0,'end');self.visible=[];query=self.query.get().strip().casefold()
+        for i,n in enumerate(self.feed['notices']):
+            if query and query not in (n['title']+' '+n['id']+' '+TYPE_LABELS.get(n['category'],n['category'])).casefold():continue
+            self.visible.append(i);flag='公開対象' if n['published'] else '下書き'
+            self.list.insert('end',f'[{flag}] {n["title"]}')
+        if self.index in self.visible:self.list.selection_set(self.visible.index(self.index))
 
-    def choose(self, event=None):
-        selected = self.list.curselection()
-        if not selected: return
-        self.index = selected[0]
-        n = self.feed['notices'][self.index]
-        for var, key in ((self.id_v,'id'), (self.title_v,'title'),
-                         (self.category_v,'category'), (self.date_v,'published_at'), (self.url_v,'url'),
-                         (self.published_v,'published'), (self.pinned_v,'pinned')):
-            var.set(n[key])
-        self.body.delete('1.0', 'end'); self.body.insert('1.0', n['body'])
+    def choose(self,event=None):
+        selected=self.list.curselection()
+        if not selected:return
+        index=self.visible[selected[0]]
+        if index==self.index:return
+        if not self.apply():self.refresh();return
+        self.load(index)
+
+    def load(self,index):
+        self.loading=True;self.index=index;n=self.feed['notices'][index]
+        for var,key in ((self.id_v,'id'),(self.title_v,'title'),(self.category_v,'category'),(self.date_v,'published_at'),(self.url_v,'url'),(self.published_v,'published'),(self.pinned_v,'pinned')):var.set(n[key])
+        self.body.delete('1.0','end');self.body.insert('1.0',n['body']);self.body.edit_modified(False)
+        self.baseline=self.values();self.loading=False;self.refresh();self.changed()
+
+    def build(self):
+        return {'id':self.id_v.get().strip(),'title':self.title_v.get().strip(),'category':self.category_v.get(),
+                'published_at':self.date_v.get().strip(),'url':self.url_v.get().strip(),
+                'pinned':bool(self.pinned_v.get()),'published':bool(self.published_v.get()),'body':self.body.get('1.0','end-1c').strip()}
 
     def apply(self):
-        if self.index is None: return True
+        if self.index is None:return True
         try:
-            n = {'id':self.id_v.get().strip(), 'title':self.title_v.get().strip(),
-                 'category':self.category_v.get(), 'published_at':self.date_v.get().strip(),
-                 'url':self.url_v.get().strip(), 'pinned':bool(self.pinned_v.get()),
-                 'published':bool(self.published_v.get()), 'body':self.body.get('1.0','end-1c').strip()}
-            next_items = list(self.feed['notices']); next_items[self.index] = n
-            self.feed = validate_feed({'schema':1, 'notices':next_items})
-            self.refresh(); self.list.selection_set(self.index)
-            return True
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror('入力エラー', str(exc)); return False
+            items=list(self.feed['notices']);items[self.index]=self.build()
+            self.feed=validate_feed({'schema':1,'notices':items});self.baseline=self.values();self.refresh();self.changed();return True
+        except (TypeError,ValueError) as exc:messagebox.showerror('入力エラー',str(exc),parent=self.parent);return False
 
     def add(self):
-        if not self.apply(): return
-        new_id = 'notice_' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-        existing = {n['id'] for n in self.feed['notices']}
-        while new_id in existing: new_id += '_1'
-        self.feed['notices'].insert(0, {'id':new_id, 'title':'新しいお知らせ', 'body':'本文を入力してください。',
-              'category':'news','pinned':False,'published':False,
-              'published_at':datetime.now().strftime('%Y-%m-%d'), 'url':RELEASES_URL})
-        self.refresh(); self.list.selection_set(0); self.choose()
+        if not self.apply():return
+        ident='notice_'+datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S');existing={n['id'] for n in self.feed['notices']}
+        while ident in existing:ident+='_1'
+        self.feed['notices'].insert(0,{'id':ident,'title':'新しいお知らせ','body':'本文を入力してください。','category':'news','pinned':False,'published':False,'published_at':datetime.now().strftime('%Y-%m-%d'),'url':RELEASES_URL})
+        self.query.set('');self.load(0)
 
     def delete(self):
         if self.index is None:return
-        if not messagebox.askyesno('削除確認', 'このお知らせを削除しますか？'):return
-        self.feed['notices'].pop(self.index);self.index=None;self.refresh()
-        if self.feed['notices']:self.list.selection_set(0);self.choose()
+        if not messagebox.askyesno('削除の確認','選択したお知らせを下書き一覧から削除しますか？\n公開済みの内容への反映には、再度公開が必要です。',parent=self.parent):return
+        index=self.index;self.feed['notices'].pop(index);self.index=None
+        if self.feed['notices']:self.load(min(index,len(self.feed['notices'])-1))
+        else:self.refresh();self.body.delete('1.0','end');self.changed()
 
-    def save(self):
-        if not self.apply(): return False
-        try:save_feed(draft_path(), self.feed)
-        except (OSError, ValueError) as exc:
-            messagebox.showerror('保存エラー', str(exc));return False
-        messagebox.showinfo('保存', '下書きをローカルへ保存しました。プレイヤーにはまだ公開されません。')
+    def save(self,silent=False):
+        import copy
+        if not self.apply():return False
+        try:save_feed(draft_path(),self.feed)
+        except (OSError,ValueError) as exc:messagebox.showerror('保存エラー',str(exc),parent=self.parent);return False
+        self.saved=copy.deepcopy(self.feed);self.changed();self.status.set('下書きを保存しました。まだGitHubには公開していません。')
         return True
 
-    def publish(self):
+    def preview(self):
+        from admin_ui import text_area
+        if self.index is None:return
         if not self.apply():return
-        if not messagebox.askyesno('GitHubへ公開',
-                    '公開済みチェックのあるお知らせが、公開リポジトリのデータを置き換えます。\nGitHubへ送信しますか？'):
-            return
-        try:
-            save_feed(draft_path(), self.feed)
-            publish_announcements(self.feed)
-        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-            messagebox.showerror('公開失敗', str(exc));return
-        messagebox.showinfo('公開', 'GitHubに公開しました。プレイヤーは次回起動時や「再読み込み」で取得します。')
+        n=self.feed['notices'][self.index];window=tk.Toplevel(self.parent);window.title('お知らせプレビュー');window.geometry('670x500');window.transient(self.parent.winfo_toplevel())
+        panel=ttk.Frame(window,padding=22);panel.pack(fill='both',expand=True)
+        ttk.Label(panel,text='公開対象' if n['published'] else '下書き / プレイヤーには届きません',style='Muted.TLabel').pack(anchor='w')
+        ttk.Label(panel,text=n['title'],style='Section.TLabel',wraplength=600).pack(anchor='w',pady=14)
+        ttk.Label(panel,text=TYPE_LABELS.get(n['category'],n['category'])+'  '+n['published_at']).pack(anchor='w')
+        text=text_area(panel);text.insert('1.0',n['body']);text.configure(state='disabled')
+        ttk.Label(panel,text=n['url'],wraplength=610,style='Muted.TLabel').pack(anchor='w',pady=10)
+
+    def publish(self):
+        import copy
+        if not self.apply():return
+        count=sum(n['published'] for n in self.feed['notices'])
+        if not messagebox.askyesno('公開内容の確認',f'公開対象 {count}件でGitHub上のお知らせを置き換えます。\n対象外の下書きは送信しません。公開しますか？',parent=self.parent):return
+        if not self.save(silent=True):return
+        feed=copy.deepcopy(self.feed)
+        self.task.run('GitHubへ公開',lambda:publish_announcements(feed),lambda _:messagebox.showinfo('公開しました','公開対象のお知らせを送信しました。',parent=self.parent),self.actions)
 
     def import_remote(self):
-        if not messagebox.askyesno('確認','今編集中の内容を破棄してGitHub上の公開情報で置き換えますか？'):
-            return
-        try:
-            self.feed = fetch_public();save_feed(draft_path(), self.feed)
-        except Exception as exc:
-            messagebox.showerror('読み込み失敗', str(exc));return
-        self.index=None;self.refresh()
-        if self.feed['notices']:self.list.selection_set(0);self.choose()
+        import copy
+        if not messagebox.askyesno('公開情報を読み込む','ローカルの下書きをGitHub上の公開情報で置き換えます。\n未公開のお知らせも一覧からなくなります。続けますか？',parent=self.parent):return
+        def done(feed):
+            self.feed=feed;save_feed(draft_path(),feed);self.saved=copy.deepcopy(feed);self.index=None;self.query.set('');self.refresh()
+            if feed['notices']:self.load(0)
+            self.status.set('公開情報を読み込みました')
+        self.task.run('公開情報を読み込み',fetch_public,done,self.actions)
 
 
 class DistributionTab:
-    def __init__(self, parent):
-        self.parent = parent
-        ttk.Label(parent, text='ゲーム配布・アップデート管理', font=('Meiryo',13,'bold')).pack(anchor='w', pady=6)
-        ttk.Label(parent, text='配布ページからZIPを公開。新しいリリースはGitHub ActionsがEXEを生成します。',
-                  wraplength=840).pack(anchor='w', pady=5)
-        header = ttk.Frame(parent);header.pack(fill='x',pady=8)
-        ttk.Button(header,text='配布ページを開く', command=lambda:webbrowser.open(RELEASES_URL)).pack(side='left', padx=5)
-        ttk.Button(header,text='ビルド結果を見る', command=lambda:webbrowser.open(f'https://github.com/{REPO}/actions')).pack(side='left', padx=5)
-        ttk.Button(header,text='GitHubログイン状態確認',command=self.check_auth).pack(side='left',padx=5)
-        ttk.Separator(parent).pack(fill='x', pady=8)
-        self.version = tk.StringVar(value=current_version())
-        ttk.Label(parent, text='新しいリリースのバージョン（GitHub main の version.json と同じにする）').pack(anchor='w', pady=2)
-        ttk.Entry(parent,textvariable=self.version,width=15).pack(anchor='w')
-        ttk.Label(parent,text='リリースノート').pack(anchor='w',pady=(12,3))
-        self.notes=tk.Text(parent,height=10,font=('Meiryo',10),wrap='word')
-        self.notes.pack(fill='both',expand=True)
-        self.notes.insert('1.0','新機能：ゲーム内のお知らせ掲示板、管理画面からの通知公開、配布管理。')
-        ttk.Label(parent, text='重要: 配信するソースの全ファイルを、先にGitHub mainへアップロードしてください。',
-                  foreground='#a33822').pack(anchor='w',pady=7)
-        ttk.Button(parent,text='バージョンを公開してEXEビルドを開始',command=self.release).pack(anchor='w',pady=7)
-        ttk.Label(parent,text='管理者PCでGitHub CLI (gh) のインストールと gh auth login が必要です。\n'
-                  'プレイヤー配布用EXEにGitHub認証情報は含まれません。',
-                  foreground='#555555').pack(anchor='w',pady=8)
+    def __init__(self,parent):
+        from admin_ui import heading, field, text_area, TaskRunner
+        self.parent=parent;self.status=tk.StringVar(value='GitHub接続は「認証を確認」から確認できます')
+        self.task=TaskRunner(parent,self.status)
+        heading(parent,'ゲーム配布・更新','配布中のSetupとビルド状況を確認し、新しいバージョンを公開します。')
+        links=ttk.LabelFrame(parent,text='公開中のファイル・ビルド');links.pack(fill='x',pady=(0,14))
+        ttk.Button(links,text='Setupの配布ページ',command=lambda:webbrowser.open(RELEASES_URL)).pack(side='left',padx=5)
+        ttk.Button(links,text='ビルド結果',command=lambda:webbrowser.open(f'https://github.com/{REPO}/actions')).pack(side='left',padx=5)
+        self.auth_button=ttk.Button(links,text='認証を確認',command=self.check_auth);self.auth_button.pack(side='left',padx=5)
+        footer=ttk.Frame(parent);footer.pack(side='bottom',fill='x',pady=(12,0))
+        self.release_button=ttk.Button(footer,text='確認してリリースを公開',style='Primary.TButton',command=self.release);self.release_button.pack(side='right')
+        ttk.Button(footer,text='下書き保存',command=self.save).pack(side='right',padx=8)
+        ttk.Label(parent,textvariable=self.status,wraplength=780,style='Muted.TLabel').pack(side='bottom',anchor='w',pady=8)
+        steps=ttk.LabelFrame(parent,text='新しいバージョンを公開する手順');steps.pack(fill='x',pady=6)
+        ttk.Label(steps,text='1. 更新するソースをGitHubのmainへ反映\n2. version.jsonと同じバージョン・変更内容を入力\n3. 公開後にビルド成功とSetupの追加を確認',justify='left').pack(anchor='w')
+        self.version=tk.StringVar(value=current_version());field(parent,'公開するバージョン（例：9.6.1）',self.version)
+        ttk.Label(parent,text='変更内容 / リリースノート（3500文字まで）').pack(anchor='w',pady=(12,4));self.notes=text_area(parent,height=8)
+        ttk.Label(parent,text='GitHub CLIでの認証が必要です。ソースのアップロードはこの画面では行いません。',wraplength=780,style='Muted.TLabel').pack(anchor='w',pady=8)
+        self.saved=(self.version.get(),'')
+        try:
+            record=json.loads(self.draft_file().read_text(encoding='utf-8'))
+            if not isinstance(record,dict) or not isinstance(record.get('version'),str) or not isinstance(record.get('notes'),str):raise ValueError('下書き形式が不正です')
+            self.version.set(record['version']);self.notes.insert('1.0',record['notes']);self.saved=(record['version'],record['notes'])
+        except FileNotFoundError:pass
+        except (OSError,ValueError):self.status.set('配布管理の下書きを読み込めませんでした。')
+
+    def draft_file(self):
+        from farm_core import state_path
+        return state_path().parent/'release_draft.json'
+
+    def has_changes(self):
+        return (self.version.get(),self.notes.get('1.0','end-1c'))!=self.saved
+
+    def save(self,silent=False):
+        import os
+        path=self.draft_file();payload={'version':self.version.get(),'notes':self.notes.get('1.0','end-1c')}
+        try:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            fd,name=tempfile.mkstemp(prefix='release_',suffix='.tmp',dir=path.parent)
+            try:
+                with os.fdopen(fd,'w',encoding='utf-8') as fp:json.dump(payload,fp,ensure_ascii=False)
+                os.replace(name,path)
+            finally:
+                from pathlib import Path
+                Path(name).unlink(missing_ok=True)
+        except OSError as exc:messagebox.showerror('下書き保存に失敗',str(exc),parent=self.parent);return False
+        self.saved=(payload['version'],payload['notes']);self.status.set('配布管理の下書きを保存しました。リリースは公開していません。');return True
 
     def check_auth(self):
-        try:check_gh_auth()
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-            messagebox.showerror('未接続',str(exc));return
-        messagebox.showinfo('GitHub','GitHub CLIで認証済みです。')
+        self.task.run('GitHub認証を確認',check_gh_auth,lambda _:self.status.set('GitHub認証済み / 公開操作を使用できます'),(self.auth_button,self.release_button))
 
     def release(self):
         version=self.version.get().strip();notes=self.notes.get('1.0','end-1c').strip()
-        if not messagebox.askyesno('配布を確定', f'GitHubのmainブランチから v{version} を公開しますか？\n'
-                       'タグ作成後にActionsがEXEと更新ファイルをビルドします。\n\n'
-                       'ソースコードはすべてGitHubへアップロード済みですか？'):
-            return
-        try:create_release(version,notes)
-        except (RuntimeError,ValueError,OSError,subprocess.TimeoutExpired) as exc:
-            messagebox.showerror('リリース失敗',str(exc));return
-        messagebox.showinfo('公開操作完了',f'v{version} のリリース作成を実行しました。\nActionsが成功したら配布ZIPを確認してください。')
-        webbrowser.open(f'https://github.com/{REPO}/actions')
+        if not re.fullmatch(r'\d+\.\d+\.\d+',version) or not notes or len(notes)>3500:
+            messagebox.showerror('入力を確認','バージョンと変更内容（1〜3500文字）を入力してください。',parent=self.parent);return
+        if not messagebox.askyesno('リリースを公開',f'mainから v{version} を公開します。\nビルド成功後にSetupが追加されます。\n\nソースの反映と変更内容を確認しましたか？',parent=self.parent):return
+        if not self.save(silent=True):return
+        self.task.run('リリースを公開',lambda:create_release(version,notes),lambda _:self.status.set(f'v{version}を作成しました。「ビルド結果」で完了を確認してください。'),(self.auth_button,self.release_button))

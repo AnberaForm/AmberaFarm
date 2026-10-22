@@ -58,63 +58,145 @@ def save_events(events,path=USER):
 
 class StoryEditor:
     def __init__(self):
-        self.root=tk.Tk();self.root.title('アンベラ牧場｜管理画面');self.root.geometry('1110x760');self.root.minsize(860,590)
-        self.events=load_story(story_path())
-        notebook=ttk.Notebook(self.root);notebook.pack(fill='both',expand=True,padx=8,pady=8)
-        main=ttk.Frame(notebook,padding=12);notebook.add(main,text='ストーリー管理')
-        notice_panel=ttk.Frame(notebook,padding=12);notebook.add(notice_panel,text='お知らせ管理')
-        distribution_panel=ttk.Frame(notebook,padding=12);notebook.add(distribution_panel,text='ゲーム配布・更新')
-        mail_panel=ttk.Frame(notebook,padding=12);notebook.add(mail_panel,text='アイテム配布')
-        self.notice_admin=NoticeAdminTab(notice_panel)
-        self.distribution_admin=DistributionTab(distribution_panel)
-        self.mail_admin=MailAdminTab(mail_panel)
-        ttk.Label(main,text='ストーリー管理 — 追加 / 編集 / 並べ替え',font=('Meiryo',15,'bold')).pack(anchor='w',pady=(0,10))
-        ttk.Label(main,text='保存先：%APPDATA%\\AmberaFarm\\story_events.json（ゲーム更新で上書きされません）').pack(anchor='w')
-        body=ttk.Panedwindow(main,orient='horizontal');body.pack(fill='both',expand=True,pady=12)
-        left=ttk.Frame(body);right=ttk.Frame(body,padding=(13,0));body.add(left,weight=1);body.add(right,weight=3)
-        self.list=tk.Listbox(left,font=('Meiryo',10));self.list.pack(fill='both',expand=True)
-        self.list.bind('<<ListboxSelect>>',self.select)
-        lf=ttk.Frame(left);lf.pack(fill='x',pady=9)
-        for caption,func in [('追加',self.add),('削除',self.remove),('↑',lambda:self.shift(-1)),('↓',lambda:self.shift(1))]:
-            ttk.Button(lf,text=caption,command=func).pack(side='left',padx=2)
+        from admin_ui import theme, heading, field, Choice, ScrollForm, list_area, text_area
+        import copy
+        self.root=tk.Tk(); self.root.title('アンベラ牧場｜管理者ツール')
+        self.root.geometry('1240x840'); self.root.minsize(1000,650); theme(self.root)
+        self.events=load_story(story_path()); self.saved_events=copy.deepcopy(self.events)
+        self.index=None; self.loading=False; self.form_baseline=None
+        self.status=tk.StringVar(value='準備できました')
+        sidebar=ttk.Frame(self.root,padding=(18,24),width=210); sidebar.pack(side='left',fill='y'); sidebar.pack_propagate(False)
+        ttk.Label(sidebar,text='AMBERA FARM',font=('Meiryo',12,'bold')).pack(anchor='w')
+        ttk.Label(sidebar,text='管理者ツール',style='Muted.TLabel').pack(anchor='w',pady=(2,25))
+        workspace=ttk.Frame(self.root); workspace.pack(side='left',fill='both',expand=True)
+        ttk.Label(workspace,textvariable=self.status,style='Muted.TLabel',padding=(22,10)).pack(side='bottom',fill='x')
+        self.pages={}; self.nav={}
+        for key,title in [('home','ホーム'),('story','ストーリー'),('notice','お知らせ'),('mail','アイテム配布'),('release','ゲーム配布・更新')]:
+            panel=ttk.Frame(workspace,padding=(22,22)); self.pages[key]=panel
+            btn=ttk.Button(sidebar,text=title,style='Nav.TButton',command=lambda k=key:self.show_page(k))
+            btn.pack(fill='x',pady=3); self.nav[key]=btn
+        ttk.Label(sidebar,text='ローカル保存と公開を\n分けて管理できます。',style='Muted.TLabel').pack(side='bottom',anchor='w')
+        self.notice_admin=NoticeAdminTab(self.pages['notice'])
+        self.mail_admin=MailAdminTab(self.pages['mail'])
+        self.distribution_admin=DistributionTab(self.pages['release'])
+        main=self.pages['story']
+        heading(main,'ストーリー','左からお話を選び、右で編集します。保存した内容は、このPCのゲームで再開時に反映されます。')
+        footer=ttk.Frame(main); footer.pack(side='bottom',fill='x',pady=(12,0))
+        ttk.Button(footer,text='変更を保存  Ctrl+S',style='Primary.TButton',command=self.save).pack(side='right')
+        ttk.Button(footer,text='会話プレビュー',command=self.preview).pack(side='right',padx=8)
+        self.story_status=tk.StringVar(value='保存済み')
+        ttk.Label(footer,textvariable=self.story_status,style='Muted.TLabel').pack(side='left')
+        body=ttk.Panedwindow(main,orient='horizontal'); body.pack(fill='both',expand=True)
+        left=ttk.Frame(body,width=280); scroll=ScrollForm(body); body.add(left,weight=1); body.add(scroll,weight=3)
+        right=scroll.content
+        self.query=tk.StringVar(); ttk.Entry(left,textvariable=self.query).pack(fill='x',pady=(0,8))
+        ttk.Label(left,text='タイトル・NPC・IDで絞り込み',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
+        self.list=list_area(left); self.list.bind('<<ListboxSelect>>',self.select)
+        tools=ttk.Frame(left); tools.pack(fill='x',pady=8)
+        for caption,func in [('追加',self.add),('複製',self.duplicate),('削除',self.remove)]:
+            ttk.Button(tools,text=caption,command=func,width=5).pack(side='left',padx=2)
+        order=ttk.Frame(left); order.pack(fill='x')
+        ttk.Button(order,text='上へ',command=lambda:self.shift(-1)).pack(side='left',padx=2)
+        ttk.Button(order,text='下へ',command=lambda:self.shift(1)).pack(side='left',padx=2)
         self.id_v=tk.StringVar();self.title_v=tk.StringVar();self.speaker_v=tk.StringVar()
         self.npc_v=tk.StringVar(value='nagi');self.kind_v=tk.StringVar(value='always')
         self.stat_v=tk.StringVar(value='planted');self.count_v=tk.StringVar(value='1');self.flag_v=tk.StringVar()
-        def labeled(label,var):
-            ttk.Label(right,text=label).pack(anchor='w',pady=(7,2));entry=ttk.Entry(right,textvariable=var);entry.pack(fill='x');return entry
-        labeled('イベントID（半角英数字）',self.id_v)
-        labeled('タイトル',self.title_v)
-        labeled('話者',self.speaker_v)
-        ttk.Label(right,text='登場NPC').pack(anchor='w',pady=(8,2))
-        ttk.Combobox(right,textvariable=self.npc_v,values=list(NPCS),state='readonly').pack(fill='x')
-        ttk.Label(right,text='発生条件').pack(anchor='w',pady=(8,2))
-        ttk.Combobox(right,textvariable=self.kind_v,values=['always','stat','flag'],state='readonly').pack(fill='x')
-        condition=ttk.Frame(right);condition.pack(fill='x',pady=4)
-        ttk.Label(condition,text='統計').grid(row=0,column=0);ttk.Combobox(condition,textvariable=self.stat_v,values=list(STATS),width=14).grid(row=0,column=1,padx=6)
-        ttk.Label(condition,text='必要回数').grid(row=0,column=2);ttk.Entry(condition,textvariable=self.count_v,width=5).grid(row=0,column=3,padx=6)
-        ttk.Label(condition,text='先行ID').grid(row=0,column=4);ttk.Entry(condition,textvariable=self.flag_v,width=16).grid(row=0,column=5,padx=6)
-        ttk.Label(right,text='台詞（1行ごとに1ページ）').pack(anchor='w',pady=(8,2))
-        self.lines=tk.Text(right,height=9,wrap='word',font=('Meiryo',10));self.lines.pack(fill='both',expand=True)
-        footer=ttk.Frame(main);footer.pack(fill='x')
-        ttk.Button(footer,text='この内容を一覧に反映',command=self.apply).pack(side='left',padx=4)
-        ttk.Button(footer,text='すべて保存',command=self.save).pack(side='left',padx=4)
-        ttk.Label(footer,text='保存後、ゲームのタイトルに戻ると再読み込みされます。').pack(side='right')
-        self.index=None;self.refresh();self.list.selection_set(0);self.select()
-        self.root.protocol('WM_DELETE_WINDOW',self.root.destroy)
+        field(right,'タイトル',self.title_v);field(right,'話者名',self.speaker_v)
+        ttk.Label(right,text='登場人物').pack(anchor='w',pady=(9,4)); Choice(right,self.npc_v,NPCS)
+        ttk.Label(right,text='発生条件').pack(anchor='w',pady=(9,4))
+        Choice(right,self.kind_v,{'always':'いつでも発生','stat':'行動の回数で発生','flag':'先行イベント後に発生'})
+        self.stat_panel=ttk.Frame(right); self.flag_panel=ttk.Frame(right)
+        ttk.Label(self.stat_panel,text='対象の行動').pack(anchor='w',pady=(8,4)); Choice(self.stat_panel,self.stat_v,STATS)
+        field(self.stat_panel,'必要な回数',self.count_v);field(self.flag_panel,'先行イベントID',self.flag_v)
+        self.condition_anchor=ttk.Frame(right);self.condition_anchor.pack(fill='x')
+        field(right,'イベントID（半角英数字・ _ ・ - ）',self.id_v)
+        ttk.Label(right,text='台詞  /  1行につき1ページ、最大25ページ').pack(anchor='w',pady=(12,4))
+        self.lines=text_area(right,height=8)
+        self.lines.bind('<<Modified>>',self.text_changed)
+        for var in (self.id_v,self.title_v,self.speaker_v,self.npc_v,self.kind_v,self.stat_v,self.count_v,self.flag_v):
+            var.trace_add('write',self.mark_dirty)
+        self.kind_v.trace_add('write',self.condition_changed)
+        self.query.trace_add('write',self.filter_changed)
+        self.refresh()
+        if self.events:self.load(0)
+        self.condition_changed();self.build_home()
+        self.root.bind('<Control-s>',self.shortcut_save)
+        self.root.protocol('WM_DELETE_WINDOW',self.close)
+        self.show_page('home')
+
+    def show_page(self,key):
+        for name,page in self.pages.items():
+            page.pack_forget(); self.nav[name].configure(style='Active.Nav.TButton' if name==key else 'Nav.TButton')
+        self.current_page=key
+        if key=='home':self.home_summary.set(self.summary())
+        self.pages[key].pack(fill='both',expand=True)
+
+    def summary(self):
+        notices=self.notice_admin.feed['notices']; published=sum(n['published'] for n in notices)
+        return f'ストーリー {len(self.events)}件   /   お知らせ {published}件公開対象・{len(notices)-published}件下書き   /   配布メール {len(self.mail_admin.items)}件'
+
+    def build_home(self):
+        from admin_ui import heading
+        import webbrowser
+        from notices import RELEASES_URL
+        home=self.pages['home'];heading(home,'管理ホーム','作成・確認・公開の作業を、ここから始められます。')
+        self.home_summary=tk.StringVar(value=self.summary())
+        ttk.Label(home,textvariable=self.home_summary,style='Section.TLabel',wraplength=800).pack(anchor='w',pady=(0,22))
+        for title,description,key in [('ストーリーを編集','このPCのお話を編集。会話のプレビューで確認して保存します。','story'),
+                ('お知らせを届ける','下書きを保存し、公開対象を確認してGitHubへ公開します。','notice'),
+                ('アイテムを配布','配布内容を編集し、全プレイヤー向けのメールを公開します。','mail'),
+                ('ゲームを配布・更新','Setupの配布ページ、ビルド結果、新しいリリースを管理します。','release')]:
+            card=ttk.LabelFrame(home,text=title);card.pack(fill='x',pady=7)
+            ttk.Button(card,text='開く →',command=lambda k=key:self.show_page(k)).pack(side='right',padx=8)
+            ttk.Label(card,text=description,wraplength=650).pack(anchor='w',pady=5)
+        ttk.Button(home,text='公開中のダウンロードページ',command=lambda:webbrowser.open(RELEASES_URL)).pack(anchor='w',pady=14)
+
+    def form_values(self):
+        return tuple(v.get() for v in (self.id_v,self.title_v,self.speaker_v,self.npc_v,self.kind_v,self.stat_v,self.count_v,self.flag_v))+(self.lines.get('1.0','end-1c'),)
+
+    def text_changed(self,event=None):
+        if self.lines.edit_modified():self.mark_dirty();self.lines.edit_modified(False)
+
+    def mark_dirty(self,*args):
+        if self.loading:return
+        dirty=self.has_changes()
+        self.story_status.set('未保存の変更があります' if dirty else '保存済み')
+
+    def has_changes(self):
+        return self.events!=self.saved_events or (self.index is not None and self.form_baseline is not None and self.form_values()!=self.form_baseline)
+
+    def condition_changed(self,*args):
+        self.stat_panel.pack_forget();self.flag_panel.pack_forget()
+        panel={'stat':self.stat_panel,'flag':self.flag_panel}.get(self.kind_v.get())
+        if panel:panel.pack(fill='x',before=self.condition_anchor,pady=4)
 
     def refresh(self):
-        self.list.delete(0,'end')
-        for event in self.events:self.list.insert('end',f'{event.get("npc","nagi")}: {event["id"]} / {event.get("title","")}')
+        query=self.query.get().strip().casefold();self.visible=[];self.list.delete(0,'end')
+        for i,event in enumerate(self.events):
+            label=f'{event["title"]}  /  {NPCS.get(event.get("npc"),event.get("npc"))}  /  {event["id"]}'
+            if query and query not in label.casefold():continue
+            self.visible.append(i);self.list.insert('end',label)
+        if self.index in self.visible:self.list.selection_set(self.visible.index(self.index))
+
+    def filter_changed(self,*args):
+        self.refresh()
 
     def select(self,event=None):
         choice=self.list.curselection()
         if not choice:return
-        self.index=choice[0];e=self.events[self.index]
-        for v,k in ((self.id_v,'id'),(self.title_v,'title'),(self.speaker_v,'speaker'),(self.npc_v,'npc')):v.set(e.get(k,'nagi' if k=='npc' else ''))
+        index=self.visible[choice[0]]
+        if index==self.index:return
+        if self.index is not None and not self.apply():self.refresh();return
+        self.load(index)
+
+    def load(self,index):
+        self.loading=True;self.index=index;e=self.events[index]
+        for v,k in ((self.id_v,'id'),(self.title_v,'title'),(self.speaker_v,'speaker'),(self.npc_v,'npc')):v.set(e.get(k,''))
         t=e.get('trigger',{'kind':'always'})
         self.kind_v.set(t.get('kind','always'));self.stat_v.set(t.get('name','planted'))
         self.count_v.set(str(t.get('at_least',1)));self.flag_v.set(t.get('id',''))
-        self.lines.delete('1.0','end');self.lines.insert('1.0','\n'.join(e['lines']))
+        self.lines.delete('1.0','end');self.lines.insert('1.0','\n'.join(e['lines']));self.lines.edit_modified(False)
+        self.form_baseline=self.form_values();self.loading=False;self.refresh();self.mark_dirty()
 
     def build(self):
         kind=self.kind_v.get()
@@ -126,44 +208,92 @@ class StoryEditor:
             'trigger':trigger,'lines':self.lines.get('1.0','end-1c').splitlines()})
 
     def apply(self):
+        if self.index is None:return True
         try:
             event=self.build()
             if any(e['id']==event['id'] for i,e in enumerate(self.events) if i!=self.index):raise ValueError('イベントIDが既に使われています')
-            self.events[self.index]=event;self.refresh();self.list.selection_set(self.index)
-            return True
-        except (ValueError,TypeError) as ex:messagebox.showerror('入力エラー',str(ex));return False
+            self.events[self.index]=event;self.form_baseline=self.form_values();self.refresh();self.mark_dirty();return True
+        except (ValueError,TypeError) as ex:messagebox.showerror('入力エラー',str(ex),parent=self.root);return False
 
     def add(self):
-        # Do not discard the old form; apply first.
-        if self.index is not None and not self.apply():return
-        self.events.append({'id':'new_event_'+str(len(self.events)+1),'title':'新しいお話','speaker':'村人','npc':'guide',
+        if not self.apply():return
+        ident='new_event';existing={e['id'] for e in self.events};n=1
+        while f'{ident}_{n}' in existing:n+=1
+        self.events.append({'id':f'{ident}_{n}','title':'新しいお話','speaker':'村人','npc':'guide',
             'trigger':{'kind':'always'},'lines':['ここに台詞を入力']})
-        self.refresh();self.list.selection_clear(0,'end');self.list.selection_set('end');self.select()
+        self.query.set('');self.load(len(self.events)-1)
+
+    def duplicate(self):
+        import copy
+        if self.index is None or not self.apply():return
+        event=copy.deepcopy(self.events[self.index]);original=event['id'][:105];n=1;existing={e['id'] for e in self.events}
+        while f'{original}_copy{n}' in existing:n+=1
+        event['id']=f'{original}_copy{n}';event['title']=event['title'][:76]+'（複製）'
+        self.events.insert(self.index+1,event);self.query.set('');self.load(self.index+1)
 
     def remove(self):
         if self.index is None:return
-        if not messagebox.askyesno('確認','このイベントを削除しますか？'):return
-        self.events.pop(self.index);self.index=None;self.refresh()
-        if self.events:self.list.selection_set(min(len(self.events)-1,0));self.select()
+        if not messagebox.askyesno('削除の確認',f'「{self.events[self.index]["title"]}」を削除しますか？',parent=self.root):return
+        index=self.index;self.events.pop(index);self.index=None
+        if self.events:self.load(min(index,len(self.events)-1))
+        else:
+            self.refresh();self.lines.delete('1.0','end');self.mark_dirty()
 
     def shift(self,delta):
-        if self.index is None:return
+        if self.index is None or not self.apply():return
         j=self.index+delta
         if not 0<=j<len(self.events):return
-        self.events[self.index],self.events[j]=self.events[j],self.events[self.index]
-        self.index=j;self.refresh();self.list.selection_set(j)
+        self.events[self.index],self.events[j]=self.events[j],self.events[self.index];self.load(j)
 
-    def save(self):
-        if self.index is not None and not self.apply():return
-        try:save_events(self.events)
-        except (OSError,ValueError) as ex:messagebox.showerror('保存に失敗',str(ex));return
-        messagebox.showinfo('保存しました',f'{len(self.events)}件のイベントを保存しました。\nゲームのタイトル画面から再開すると反映されます。')
+    def save(self,silent=False):
+        import copy
+        if not self.apply():return False
+        try:save_events(self.events,USER)
+        except (OSError,ValueError) as ex:messagebox.showerror('保存に失敗',str(ex),parent=self.root);return False
+        self.saved_events=copy.deepcopy(self.events);self.mark_dirty();self.status.set('ストーリーを保存しました。ゲームを再開すると反映されます。')
+        if not silent:messagebox.showinfo('保存しました',f'{len(self.events)}件のお話を保存しました。',parent=self.root)
+        return True
+
+    def preview(self):
+        if self.index is None:return
+        try:event=self.build()
+        except (ValueError,TypeError) as exc:messagebox.showerror('プレビューできません',str(exc),parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('会話プレビュー');window.geometry('640x370');window.transient(self.root)
+        panel=ttk.Frame(window,padding=24);panel.pack(fill='both',expand=True)
+        ttk.Label(panel,text=event['title'],style='Section.TLabel').pack(anchor='w',pady=8)
+        ttk.Label(panel,text=event['speaker'],foreground='#32664e').pack(anchor='w',pady=8)
+        page=tk.IntVar(master=window,value=0);body=tk.StringVar(master=window);counter=tk.StringVar(master=window)
+        ttk.Label(panel,textvariable=body,wraplength=570,font=('Meiryo',12)).pack(fill='both',expand=True,pady=15)
+        controls=ttk.Frame(panel);controls.pack(fill='x')
+        def show(delta=0):
+            page.set(max(0,min(len(event['lines'])-1,page.get()+delta)));body.set(event['lines'][page.get()]);counter.set(f'{page.get()+1} / {len(event["lines"])} ページ')
+        ttk.Button(controls,text='前へ',command=lambda:show(-1)).pack(side='left')
+        ttk.Label(controls,textvariable=counter).pack(side='left',padx=20)
+        ttk.Button(controls,text='次へ',command=lambda:show(1)).pack(side='left');show()
+
+    def shortcut_save(self,event=None):
+        if self.current_page=='story':self.save()
+        elif self.current_page=='notice':self.notice_admin.save()
+        elif self.current_page=='mail':self.mail_admin.save()
+        elif self.current_page=='release':self.distribution_admin.save()
+        return 'break'
+
+    def close(self):
+        if any(task.busy for task in (self.notice_admin.task,self.mail_admin.task,self.distribution_admin.task)):
+            messagebox.showinfo('処理中','公開・読み込み処理の完了後に閉じてください。',parent=self.root);return
+        if self.has_changes() or self.notice_admin.has_changes() or self.mail_admin.has_changes() or self.distribution_admin.has_changes():
+            answer=messagebox.askyesnocancel('未保存の変更','変更をローカルに保存して終了しますか？\n「いいえ」は変更を破棄します。GitHubには公開しません。',parent=self.root)
+            if answer is None:return
+            if answer and not (self.save(silent=True) and self.notice_admin.save(silent=True) and self.mail_admin.save(silent=True) and self.distribution_admin.save(silent=True)):return
+        self.root.destroy()
 
 def login_and_open():
     """Require the supplied local administrator code and password before editing."""
     root = tk.Tk()
-    root.title('Ambera Farm - Story Admin Login')
-    root.geometry('430x310')
+    root.title('アンベラ牧場｜管理者ログイン')
+    root.geometry('480x380')
+    from admin_ui import theme
+    theme(root)
     root.resizable(False, False)
     code = tk.StringVar()
     password = tk.StringVar()
@@ -198,5 +328,11 @@ def login_and_open():
 
 
 if __name__ == '__main__':
-    login_and_open()
+    import sys
+    if '--admin-smoke-test' in sys.argv:
+        from verify_admin_ui import run
+        target=sys.argv[sys.argv.index('--report-dir')+1] if '--report-dir' in sys.argv else 'build_output/admin_ui_checks'
+        run(target)
+    else:
+        login_and_open()
 
