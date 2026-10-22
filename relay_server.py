@@ -15,6 +15,7 @@ import re
 import secrets
 import signal
 import time
+import unicodedata
 
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
@@ -33,14 +34,30 @@ class Room:
     tickets: dict = field(default_factory=dict)
     guests: set = field(default_factory=set)
     tunnels: set = field(default_factory=set)
+    title: str = ''
+    host_name: str = ''
+    public: bool = False
+    requests: dict = field(default_factory=dict)
+    approvals: dict = field(default_factory=dict)
+
+
+def clean_label(value, limit=24):
+    if not isinstance(value, str):
+        return ''
+    return ''.join(c for c in value if c.isprintable() and c not in '\r\n\t')[:limit].strip()
+
+
+def search_key(value):
+    return unicodedata.normalize('NFKC', value).casefold()
 
 
 class RelayServer:
-    def __init__(self, max_rooms=100, max_connections=1600, pair_timeout=8):
+    def __init__(self, max_rooms=100, max_connections=1600, pair_timeout=8, request_timeout=180):
         self.rooms = {}
         self.max_rooms = max_rooms
         self.max_connections = max_connections
         self.pair_timeout = pair_timeout
+        self.request_timeout = request_timeout
         self.connections = 0
         self.attempts = OrderedDict()
         self.creators = {}
@@ -94,6 +111,10 @@ class RelayServer:
                 await self._join(ws, data)
             elif op == 'tunnel':
                 await self._tunnel(ws, data)
+            elif op == 'list':
+                await self._list(ws, data)
+            elif op == 'request':
+                await self._request(ws, data)
             else:
                 await self._error(ws, 'denied')
         except (ConnectionClosed, asyncio.TimeoutError, ValueError, TypeError, KeyError):
@@ -113,7 +134,10 @@ class RelayServer:
         code = ''.join(secrets.choice(CODE_ALPHABET) for _ in range(8))
         while code in self.rooms:
             code = ''.join(secrets.choice(CODE_ALPHABET) for _ in range(8))
-        room = Room(ws, pin, protocol)
+        room = Room(ws, pin, protocol,
+                    title=clean_label(data.get('title')) or 'みんなの牧場',
+                    host_name=clean_label(data.get('name'), 18) or '牧場主',
+                    public=data.get('public') is True)
         self.rooms[code] = room
         self.creators[address] = self.creators.get(address, 0) + 1
         try:
@@ -121,16 +145,29 @@ class RelayServer:
             # Only the authenticated host control connection can end this room.
             # Ping/pong still detects hosts that disappear without a leave.
             async for raw in ws:
-                if isinstance(raw, str) and len(raw) <= 64 and json.loads(raw) == {'op': 'leave'}:
+                if not isinstance(raw, str) or len(raw) > 1024:
+                    await ws.close(code=1008, reason='Unexpected control message')
+                    break
+                message = json.loads(raw)
+                if message == {'op': 'leave'}:
                     await self._send(ws, {'type': 'closed'})
+                    break
+                elif (isinstance(message, dict) and message.get('op') == 'decide'
+                      and isinstance(message.get('id'), str)
+                      and type(message.get('accept')) is bool):
+                    await self._decide(room, message['id'], message['accept'])
                 else:
                     await ws.close(code=1008, reason='Unexpected control message')
-                break
+                    break
         finally:
             self.rooms.pop(code, None)
             self.creators[address] -= 1
             if not self.creators[address]:
                 self.creators.pop(address)
+            room.approvals.clear()
+            for request in list(room.requests.values()):
+                if not request['decision'].done():
+                    request['decision'].set_result({'type': 'error', 'code': 'host_left'})
             for pair in list(room.tickets.values()):
                 if not pair.done():
                     pair.cancel()
@@ -146,6 +183,92 @@ class RelayServer:
             await asyncio.gather(*(end_stream(s) for s in list(room.guests | room.tunnels)),
                                  return_exceptions=True)
 
+    def _prune_approvals(self, room):
+        now = time.monotonic()
+        for token, expires in list(room.approvals.items()):
+            if expires <= now:
+                room.approvals.pop(token, None)
+
+    async def _list(self, ws, data):
+        query = search_key(clean_label(data.get('query'), 40))
+        rows = []
+        for code, room in list(self.rooms.items()):
+            if not room.public or room.protocol != data.get('protocol'):
+                continue
+            if query and query not in search_key(room.title + ' ' + room.host_name):
+                continue
+            rows.append({'id': code, 'title': room.title, 'host': room.host_name,
+                         'players': len(room.guests) + 1, 'max_players': 8})
+        # A directory reply never contains PINs, host secrets, tickets or saves.
+        await self._send(ws, {'type': 'rooms', 'rooms': rows[:100]})
+
+    async def _request(self, ws, data):
+        room = self.rooms.get(data.get('code')) if isinstance(data.get('code'), str) else None
+        if not room or not room.public:
+            await self._error(ws, 'not_found')
+            return
+        if room.protocol != data.get('protocol'):
+            await self._error(ws, 'version')
+            return
+        self._prune_approvals(room)
+        if len(room.guests) + len(room.approvals) >= 7:
+            await self._error(ws, 'full')
+            return
+        if len(room.requests) >= 16:
+            await self._error(ws, 'requests_full')
+            return
+        name = clean_label(data.get('name'), 18)
+        if not name:
+            await self._error(ws, 'denied')
+            return
+        request_id = secrets.token_hex(12)
+        decision = asyncio.get_running_loop().create_future()
+        room.requests[request_id] = {'name': name, 'decision': decision}
+        watcher = None
+        try:
+            await self._send(ws, {'type': 'pending', 'id': request_id})
+            await self._send(room.control, {'type': 'join_request',
+                                          'request': {'id': request_id, 'name': name}})
+            watcher = asyncio.create_task(ws.recv())
+            done, _ = await asyncio.wait([decision, watcher], timeout=self.request_timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if decision in done:
+                await self._send(ws, decision.result())
+            elif watcher in done:
+                # Disconnect/cancel withdraws the request immediately.
+                try:
+                    watcher.result()
+                    await self._send(ws, {'type': 'cancelled'})
+                except ConnectionClosed:pass
+            else:
+                await self._error(ws, 'request_timeout')
+        finally:
+            room.requests.pop(request_id, None)
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            if not decision.done():
+                decision.cancel()
+            try:
+                await self._send(room.control, {'type': 'request_removed', 'id': request_id})
+            except (ConnectionClosed, asyncio.TimeoutError):
+                pass
+
+    async def _decide(self, room, request_id, accept):
+        request = room.requests.get(request_id)
+        if request is None or request['decision'].done():
+            return
+        self._prune_approvals(room)
+        if not accept:
+            result = {'type': 'error', 'code': 'rejected'}
+        elif len(room.guests) + len(room.approvals) >= 7:
+            result = {'type': 'error', 'code': 'full'}
+        else:
+            token = secrets.token_hex(32)
+            room.approvals[token] = time.monotonic() + 30
+            result = {'type': 'approved', 'approval': token, 'pin': room.pin}
+        request['decision'].set_result(result)
+
     async def _join(self, ws, data):
         code, pin = data.get('code'), data.get('pin')
         if not isinstance(code, str) or not isinstance(pin, str):
@@ -159,6 +282,13 @@ class RelayServer:
         if data.get('protocol') != room.protocol:
             await self._error(ws, 'version')
             return
+        self._prune_approvals(room)
+        if room.public:
+            token = data.get('approval')
+            if not isinstance(token, str) or token not in room.approvals:
+                await self._error(ws, 'approval_required')
+                return
+            room.approvals.pop(token)
         if len(room.guests) >= 7:
             await self._error(ws, 'full')
             return

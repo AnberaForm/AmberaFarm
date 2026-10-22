@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""LAN co-op protocol v4: low-bandwidth position streaming and async outgoing queue.
+"""Co-op protocol v14: room-owned saves and low-bandwidth position streaming.
 
 Only plots are shared. Each connection has a separate inventory, money, stats,
-missions and story flags. Guests save their own profile on their own computer.
-Host saves the common plots with the host's profile. PINs are not encryption;
+missions and story flags. Game entry points use room_owned=True: the host stores
+room-specific profiles and ignores personal saves. Legacy profile mode remains
+available to older local tooling. PINs are not encryption;
 never forward this prototype's port to the public internet.
 """
 from __future__ import annotations
@@ -42,11 +43,12 @@ from area_world import (OUTDOOR, NEIGHBOR, AREAS, can_enter, at_facility,
                         area_view, valid_scene_point, DIRECTIONS)
 from profile_progress import (init_profile, public_profile, refresh_progress,
                               claim_daily, apply_arena_result, clean_bio, unlocked_titles)
+from room_saves import load_room, save_room, member_key, MAX_MEMBERS
 
 PORT = 47821
 MAX_PLAYERS = 8
 MAX_PACKET = 131072
-PROTOCOL = 13
+PROTOCOL = 14
 POSITION_INTERVAL = 1.0 / 12.0
 STATE_INTERVAL = 1.5
 CHAT_INTERVAL = 0.08
@@ -84,10 +86,15 @@ class _GameServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 class RoomServer:
     def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None, fresh=False,
-                 bind='0.0.0.0'):
+                 bind='0.0.0.0', room_owned=False):
         self.pin = str(pin if pin is not None else secrets.randbelow(900000) + 100000)
         self.host_token = secrets.token_hex(24)
-        self.state = validate_state(copy.deepcopy(state))
+        self.room_owned = bool(room_owned)
+        self.members = {}
+        if self.room_owned:
+            self.state, self.members = load_room(save_file)
+        else:
+            self.state = validate_state(copy.deepcopy(state))
         if fresh:
             self.state['plots']=[None] * PLOT_COUNT
             init_v8(self.state)['plot_preparation']=[0]*PLOT_COUNT
@@ -135,7 +142,26 @@ class RoomServer:
                                 sock.sendall(pack({'type': 'error', 'message': 'Host already connected'}))
                                 return
                             profile = parent.host_profile
+                            identity = 'host'
+                        elif parent.room_owned:
+                            try:
+                                identity = member_key(hello.get('identity'))
+                            except ValueError:
+                                sock.sendall(pack({'type': 'error', 'message': 'Invalid room identity'}))
+                                return
+                            if any(p.get('identity') == identity for p in parent.players.values()):
+                                sock.sendall(pack({'type': 'error', 'message': 'この牧場にはすでに参加しています。'}))
+                                return
+                            if identity not in parent.members:
+                                if len(parent.members) >= MAX_MEMBERS:
+                                    sock.sendall(pack({'type': 'error', 'message': 'この牧場の参加者保存数が上限です。'}))
+                                    return
+                                parent.members[identity] = init_v8(new_state())
+                            # Coins, items, missions, plots and public UIDs supplied
+                            # by the joining PC are deliberately ignored.
+                            profile = parent.members[identity]
                         else:
+                            identity = None
                             try:
                                 profile = validate_state(hello.get('profile'))
                             except (SaveError, ValueError, TypeError):
@@ -148,7 +174,7 @@ class RoomServer:
                         parent.players[pid] = {
                             'id': pid, 'name': safe_name(hello.get('name')),
                             'x': x, 'y': y, 'last': time.monotonic(), 'move_seq': -1, 'move_step_seq': 0,
-                            'profile': profile, 'last_chat': 0., 'last_rescue': 0.,
+                            'profile': profile, 'identity': identity, 'last_chat': 0., 'last_rescue': 0.,
                             'uid':profile['player_uid'], 'emote':'', 'emote_seq':0, 'emote_until':0., 'last_emote':0., 'party_id':None,
                             'area':OUTDOOR, 'scene_x':ROOM_SPAWN[0], 'scene_y':ROOM_SPAWN[1],
                             'scene_seq':-1, 'scene_revision':0, 'scene_last':time.monotonic(),
@@ -156,8 +182,10 @@ class RoomServer:
                         }
                         if is_host:
                             parent.host_id = pid
+                        profile['player_name'] = safe_name(hello.get('name'))
                         parent.sockets[pid] = sock
-                    sock.sendall(pack({'type': 'welcome', 'id': pid, 'pin': parent.pin, 'spawn': [x, y]}))
+                    sock.sendall(pack({'type': 'welcome', 'id': pid, 'pin': parent.pin,
+                                       'spawn': [x, y], 'room_owned': parent.room_owned}))
                     # Keep TCP packets small and disable Nagle's delay on position inputs.
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     sock.settimeout(None)
@@ -194,6 +222,7 @@ class RoomServer:
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                        for x in parent.friend_invites.get(pid, []) if x in parent.players],
+                                    'friend_sent': [target for target, invites in parent.friend_invites.items() if pid in invites],
                                     'party': parent.party_view(pid),
                                     'story_nodes': parent.story_nodes,
                                     'players': [dict({k: member[k] for k in ('id', 'name', 'x', 'y', 'uid', 'emote', 'emote_seq', 'area', 'scene_x', 'scene_y', 'facing')},
@@ -288,6 +317,7 @@ class RoomServer:
                                     'coop_board': board_view(parent.coop_board),
                                     'friend_invites': [{'id': x, 'name': parent.players[x]['name']}
                                                       for x in parent.friend_invites.get(pid, []) if x in parent.players],
+                                    'friend_sent': [target for target, invites in parent.friend_invites.items() if pid in invites],
                                     'party': parent.party_view(pid)}
                                 response['self_area'] = area_view(parent.players[pid])
                                 response['fishing'] = parent.fishing_view(pid)
@@ -312,6 +342,9 @@ class RoomServer:
                                 if inviter==pid:parent.party_invites.pop(target,None)
                             for invites in parent.friend_invites.values():
                                 if pid in invites:invites.remove(pid)
+                            if parent.room_owned:
+                                try:parent._save_host()
+                                except (OSError, SaveError):pass
                             parent.players.pop(pid, None)
                             parent.sockets.pop(pid, None)
                             if pid == parent.host_id:
@@ -329,7 +362,10 @@ class RoomServer:
     def _save_host(self):
         # Host profile is the local save. Guest balances never enter this file.
         self.state = merged_view(self.host_profile, self.state['plots'], self.state['plot_preparation'])
-        save_state(self.state, self.save_file)
+        if self.room_owned:
+            save_room(self.save_file, self.state, self.members)
+        else:
+            save_state(self.state, self.save_file)
 
     def party_view(self,pid):
         player=self.players[pid]
@@ -554,6 +590,11 @@ class RoomServer:
                 owner['profile']['profile_cache'][peer['uid']]=public_profile(peer['profile'])
             self._save_host()
             return 'フレンドになりました！'
+        if action=='friend_reject':
+            invites=self.friend_invites.get(pid,[])
+            if data not in invites:return '申請を確認できません'
+            invites.remove(data)
+            return 'フレンド申請を見送りました'
         return '対応していない申請です'
 
     def arena_view(self,pid):
@@ -853,7 +894,7 @@ class RoomServer:
             if claim_daily(profile,data):
                 self._save_host();return '村の依頼を達成しました！'
             return '依頼がまだ未達成か、受取済みです'
-        if action in ('friend_request','friend_accept'):
+        if action in ('friend_request','friend_accept','friend_reject'):
             return self._friend_action(pid,action,data)
         if isinstance(action,str) and action.startswith('duel_'):
             return self._duel_action(pid,action,data)
@@ -981,7 +1022,7 @@ class RoomServer:
 
 class RoomClient:
     def __init__(self, address, pin, name='Player', timeout=5, profile=None, host_token=None,
-                 connection=None):
+                 connection=None, identity=None, room_owned=False):
         if ':' in address and address.count(':') == 1:
             host, port = address.rsplit(':', 1)
             port = int(port)
@@ -991,9 +1032,11 @@ class RoomClient:
         self.reader = None
         try:
             self.sock.settimeout(timeout)
-            profile = validate_state(copy.deepcopy(profile)) if profile is not None else new_state()
+            profile = (new_state() if room_owned else
+                       validate_state(copy.deepcopy(profile)) if profile is not None else new_state())
             hello = {'type': 'hello', 'protocol': PROTOCOL, 'pin': str(pin).strip(),
-                     'name': safe_name(name), 'profile': profile}
+                     'name': safe_name(name), 'profile': profile,
+                     'identity': identity or secrets.token_hex(32)}
             if host_token:
                 hello['host_token'] = host_token
             self.sock.sendall(pack(hello))
@@ -1010,6 +1053,7 @@ class RoomClient:
             if self.reader is not None:self.reader.close()
             raise
         self.id = welcome['id']
+        self.room_owned = bool(welcome.get('room_owned'))
         self.spawn = welcome.get('spawn', list(SPAWN))
         self.inbox = queue.Queue(maxsize=64)
         self.out_lock = threading.Lock()

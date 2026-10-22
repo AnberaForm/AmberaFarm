@@ -53,6 +53,7 @@ from world_map import (BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, 
                        can_stand, plot_world as map_plot_world)
 from multiplayer import RoomServer, RoomClient, PORT
 from online_ui import InternetRoomsMixin
+from room_saves import room_file, local_room_identity
 from player_movement import (move_character, safe_destination, walkable_short_path,
                              reconcile_prediction, MovementTrail, interpolate_around_obstacles)
 from updater import current_version, get_config, fetch_manifest
@@ -423,7 +424,7 @@ class Game(InternetRoomsMixin):
         pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=1024)
         pygame.init()
         pygame.font.init()
-        pygame.display.set_caption('アンベラ牧場 - v9.3 歩行・ミニゲーム・オンライン拡張')
+        pygame.display.set_caption('アンベラ牧場 - v9.6 部屋検索・申請・専用牧場')
         self.settings = load_settings()
         self.screen = None
         self.stage = pygame.Surface((BASE_W, BASE_H)).convert() if pygame.display.get_surface() else pygame.Surface((BASE_W, BASE_H))
@@ -567,6 +568,7 @@ class Game(InternetRoomsMixin):
         self.offline_state = None
         self.remote_players = []
         self.friend_invites=[]
+        self.friend_sent=[]
         self.party_state={'members':[],'invite':None}
         self.room_pin = ''
         self.last_network_pos = 0
@@ -768,24 +770,21 @@ class Game(InternetRoomsMixin):
         except OSError:return 'ipconfig で確認'
 
     def start_room(self):
-        if self.slot_kind!='online':
-            self.modal='save_slots';self.say('オンラインセーブ枠を選んでください。通常枠からコピーできます。',9);return
-        if self.read_only:
-            self.say('セーブ復元が必要です。破損セーブ保護中は部屋を開けません。',12);return
         if self.online_client:return
         try:
             self.host_offline_state=copy.deepcopy(self.state)
-            self.online_server=RoomServer(self.state,
-                self.save_file.with_name('coop_room_latest.json'),port=PORT,
-                story_nodes=self.story_nodes,fresh=False)
+            self.online_server=RoomServer(new_state(),room_file(self.host_world_slot),port=PORT,
+                story_nodes=self.story_nodes,room_owned=True)
             self.room_pin=self.online_server.pin
-            self.online_client=RoomClient('127.0.0.1:'+str(self.online_server.port),self.room_pin,self.state['player_name'],profile=self.state,host_token=self.online_server.host_token)
+            self.online_client=RoomClient('127.0.0.1:'+str(self.online_server.port),self.room_pin,self.state['player_name'],
+                host_token=self.online_server.host_token,room_owned=True,identity=local_room_identity())
+            self.online_room_owned=True
             self.reset_map_state()
             self.player=list(self.online_client.spawn)
             self.online_guest=False
             self.scene='world';self.modal=None
             self.say(f'部屋を作成！ LAN: {self.lan_address()}:{self.online_server.port} / PIN {self.room_pin}', 30)
-        except (OSError,ValueError,ConnectionError) as exc:
+        except (OSError,ValueError,ConnectionError,SaveError) as exc:
             if self.online_server:
                 self.online_server.close();self.online_server=None
             self.say(f'部屋の作成に失敗: {exc}',15)
@@ -796,12 +795,12 @@ class Game(InternetRoomsMixin):
         if self.online_intent=='host':
             pygame.key.stop_text_input();pygame.key.set_repeat()
             self.start_room();return
-        if self.slot_kind!='online':
-            self.modal='save_slots';self.say('オンラインセーブ枠を選択してください。',9);return
         if self.online_client:return
         try:
             self.offline_state=copy.deepcopy(self.state)
-            self.online_client=RoomClient(self.join_fields['address'].strip(),self.join_fields['pin'],self.join_fields['name'],profile=self.state)
+            self.online_client=RoomClient(self.join_fields['address'].strip(),self.join_fields['pin'],self.join_fields['name'],
+                room_owned=True,identity=local_room_identity())
+            self.online_room_owned=self.online_client.room_owned
             self.reset_map_state()
             self.online_guest=True
             self.player=list(self.online_client.spawn)
@@ -815,6 +814,10 @@ class Game(InternetRoomsMixin):
 
     def save_guest_profile(self, quiet=True):
         """Save earned personal items locally WITHOUT replacing the guest's offline farm."""
+        if self.online_room_owned:
+            self.last_guest_save=time.monotonic()
+            if not quiet:self.say('部屋の進行は部屋主のオンライン牧場へ自動保存しています。')
+            return True
         if not self.online_guest or not self.online_profile_received or not self.offline_state:
             return False
         if self.read_only:
@@ -835,6 +838,7 @@ class Game(InternetRoomsMixin):
             return False
 
     def stop_online(self):
+        room_owned=self.online_room_owned
         if self.online_relay:
             self.online_relay.close()
             self.online_relay=None
@@ -854,20 +858,29 @@ class Game(InternetRoomsMixin):
                 # Room plots are separate; host's private progression is retained.
                 previous=self.host_offline_state
                 current=self.state
-                for k,value in current.items():
-                    if k not in ('created_at','player','version'):
-                        previous[k]=copy.deepcopy(value)
+                if not room_owned:
+                    for k,value in current.items():
+                        if k not in ('created_at','player','version'):
+                            previous[k]=copy.deepcopy(value)
                 self.state=previous
                 self.host_offline_state=None
-                self.persist(True)
+                if not room_owned:self.persist(True)
+                self.player=list(self.state['player'])
+                self.selected=self.state['selected_crop']
         if self.online_guest:
             self.state = self.offline_state if self.offline_state is not None else self.state
             self.player = list(self.state['player'])
+            self.selected=self.state['selected_crop']
         if self.modal == 'chat':
             pygame.key.stop_text_input()
         self.offline_state = None
         self.online_profile_received = False
         self.online_guest = False
+        self.online_room_owned = False
+        self.friend_invites=[]
+        self.friend_sent=[]
+        self.seen_admissions.clear()
+        self.seen_friend_requests.clear()
         self.remote_players = []
         self.remote_targets = {}
         self.move_seq = 0
@@ -1015,6 +1028,7 @@ class Game(InternetRoomsMixin):
                         self.modal='arena_match'
                     self.coop_board=packet.get('coop_board',self.coop_board)
                     self.friend_invites=packet.get('friend_invites',[])
+                    self.friend_sent=packet.get('friend_sent',[])
                     self.party_state=packet.get('party',self.party_state)
                     self.update_remote_positions(packet.get('players', []))
                     self.sync_position(packet.get('self_pos'), packet.get('move_seq'),
@@ -1050,6 +1064,7 @@ class Game(InternetRoomsMixin):
                     self.modal='arena_match'
                 self.coop_board=packet.get('coop_board',self.coop_board)
                 self.friend_invites=packet.get('friend_invites',self.friend_invites)
+                self.friend_sent=packet.get('friend_sent',self.friend_sent)
                 self.party_state=packet.get('party',self.party_state)
                 if isinstance(packet.get('state'), dict):
                     incoming = packet['state']
@@ -1064,7 +1079,7 @@ class Game(InternetRoomsMixin):
                 self.reload_story()
                 self.scene = 'title'
                 self.modal = None
-                self.say('ホストとの接続が切れました。自分の所持金と持ち物を保存しました。', 12)
+                self.say('部屋との接続が切れました。進行は部屋主の牧場に保存されます。', 12)
                 return
         if not self.online_client:
             return
@@ -1368,9 +1383,13 @@ class Game(InternetRoomsMixin):
         if self.modal=='name_edit':return ((288,280,704,92),self.name_draft,self.name_cursor,self.name_anchor,27,313,'name')
         if self.modal=='chat':return ((233,554,817,73),self.chat_text,self.chat_cursor,self.chat_anchor,20,249,'chat')
         if self.modal=='join':
-            row=['address','pin','name'].index(self.join_field)
+            row=self.join_row_keys().index(self.join_field)
             return ((264,238+112*row,748,57),self.join_fields[self.join_field],self.join_cursor[self.join_field],
                     self.join_anchor[self.join_field],22,282,'join')
+        if self.modal=='room_browser':
+            k=self.browser_field
+            rect=(244,164,310,42) if k=='name' else (570,164,358,42)
+            return (rect,self.browser_fields[k],self.browser_cursor[k],self.browser_anchor[k],18,rect[0]+16,'browser')
         if self.modal=='profile_edit':return ((266,219,755,141),self.bio_draft,self.bio_cursor,self.bio_anchor,22,289,'bio')
         return None
 
@@ -1380,7 +1399,7 @@ class Game(InternetRoomsMixin):
         rect,value,cursor,anchor,size,start_x,kind=info
         if not pygame.Rect(rect).collidepoint(mouse) and not drag:return False
         font=self.fonts.get(size)
-        maxwidth={'bio':715,'name':644,'chat':787,'join':710}[kind]
+        maxwidth=rect[2]-32 if kind=='browser' else {'bio':715,'name':644,'chat':787,'join':710}[kind]
         start=self.editor_visible_start(value,cursor,maxwidth,size)
         view=value[start:]
         while view and font.size(view)[0]>maxwidth-12:view=view[:-1]
@@ -1393,6 +1412,8 @@ class Game(InternetRoomsMixin):
         elif kind=='bio':self.bio_cursor=idx;self.bio_anchor=anchor
         elif kind=='join':
             k=self.join_field;self.join_cursor[k]=idx;self.join_anchor[k]=anchor
+        elif kind=='browser':
+            k=self.browser_field;self.browser_cursor[k]=idx;self.browser_anchor[k]=anchor
         return True
 
     def persist(self, quiet=False):
@@ -1608,6 +1629,19 @@ class Game(InternetRoomsMixin):
                 import_offline_to_online(source,dest)
                 self.say(f'通常セーブ{source}をオンライン枠{dest}にコピーしました。')
             except (SaveError,OSError) as exc:self.say(str(exc),10)
+        elif action=='room_search':self.refresh_room_directory()
+        elif action=='browser_field':self.browser_field=val
+        elif action=='browser_page':self.directory_page=max(0,min((len(self.directory_rows)-1)//5,self.directory_page+val))
+        elif action=='room_request':self.request_room_entry(val)
+        elif action=='requests':
+            pygame.key.stop_text_input();pygame.key.set_repeat()
+            self.requests_page=0;self.modal='requests'
+        elif action=='requests_page':self.requests_page=max(0,min((len(self.pending_requests())-1)//6,self.requests_page+val))
+        elif action=='request_decide':
+            if self.online_relay:
+                if self.online_relay.decide(*val):self.say('承認を送りました。' if val[1] else '申請を見送りました。',6)
+        elif action=='host_public':self.host_public=not self.host_public
+        elif action=='host_world':self.host_world_slot=val
         elif action=='neighbor_visit':
             self.enter_area(NEIGHBOR)
         elif action=='neighbor_shop':
@@ -1842,9 +1876,12 @@ class Game(InternetRoomsMixin):
             else:self.say('受取済み、または無効なメールです。')
         elif action=='friends':self.modal='friends'
         elif action=='friend_request':
-            if self.online_client:self.online_client.action('friend_request',val)
+            if self.online_client and self.online_client.action('friend_request',val):
+                if val not in self.friend_sent:self.friend_sent.append(val)
         elif action=='friend_accept':
             if self.online_client:self.online_client.action('friend_accept',val)
+        elif action=='friend_reject':
+            if self.online_client:self.online_client.action('friend_reject',val)
         elif action=='friend_add':
             if add_friend(self.state,val):self.persist(True);self.say('フレンドメモに追加しました。')
             else:self.say('追加できません。')
@@ -1885,7 +1922,8 @@ class Game(InternetRoomsMixin):
         elif action=='open_release_page':webbrowser.open(val or RELEASES_URL)
         elif action=='host_room':self.reload_story();self.start_room()
         elif action=='online_host_dialog':self.reload_story();self.open_online_dialog('host')
-        elif action=='join_dialog':self.open_online_dialog('join')
+        elif action=='join_dialog':self.open_room_browser()
+        elif action=='join_code_dialog':self.open_online_dialog('join')
         elif action=='online_mode':self.set_online_mode(val)
         elif action=='online_cancel':self.cancel_internet_connection()
         elif action=='copy_room_invite':self.copy_room_invite()
@@ -1932,7 +1970,7 @@ class Game(InternetRoomsMixin):
         elif action=='close':
             if self.modal=='chat':self.close_chat()
             else:
-                if self.modal in ('join','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
+                if self.modal in ('join','room_browser','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
                 self.close_overlay()
         elif action=='fish_again':self.start_fishing()
         elif action=='fish_sell':
@@ -2090,8 +2128,13 @@ class Game(InternetRoomsMixin):
             elif event.type==pygame.TEXTINPUT and self.modal=='join':
                 k=self.join_field
                 value=self.join_fields[k]
-                value,cursor,anchor=self.edit_text_event(event,value,self.join_cursor[k],self.join_anchor[k],18 if k=='name' else 512)
+                value,cursor,anchor=self.edit_text_event(event,value,self.join_cursor[k],self.join_anchor[k],{'name':18,'title':24}.get(k,512))
                 self.join_fields[k]=value;self.join_cursor[k]=cursor;self.join_anchor[k]=anchor
+            elif event.type==pygame.TEXTINPUT and self.modal=='room_browser':
+                k=self.browser_field
+                value,cursor,anchor=self.edit_text_event(event,self.browser_fields[k],self.browser_cursor[k],
+                    self.browser_anchor[k],18 if k=='name' else 40)
+                self.browser_fields[k]=value;self.browser_cursor[k]=cursor;self.browser_anchor[k]=anchor
             elif event.type==pygame.KEYDOWN:
                 if self.modal=='online_connect':
                     if event.key==pygame.K_ESCAPE:self.cancel_internet_connection()
@@ -2139,6 +2182,15 @@ class Game(InternetRoomsMixin):
                         self.chat_text,self.chat_cursor,self.chat_anchor=self.edit_text_event(
                             event,self.chat_text,self.chat_cursor,self.chat_anchor)
                     continue
+                if self.modal=='room_browser' and event.key not in (pygame.K_ESCAPE,pygame.K_F11):
+                    if event.key==pygame.K_TAB:self.browser_field='name' if self.browser_field=='query' else 'query'
+                    elif event.key in (pygame.K_RETURN,pygame.K_KP_ENTER):self.refresh_room_directory()
+                    else:
+                        k=self.browser_field
+                        v,cur,anchor=self.edit_text_event(event,self.browser_fields[k],self.browser_cursor[k],
+                            self.browser_anchor[k],18 if k=='name' else 40)
+                        self.browser_fields[k]=v;self.browser_cursor[k]=cur;self.browser_anchor[k]=anchor
+                    continue
                 if self.modal=='join' and event.key not in (pygame.K_ESCAPE,pygame.K_F11):
                     if event.key==pygame.K_TAB:
                         order=self.join_edit_keys()
@@ -2146,7 +2198,7 @@ class Game(InternetRoomsMixin):
                     elif event.key in (pygame.K_RETURN,pygame.K_KP_ENTER):self.join_room()
                     else:
                         k=self.join_field
-                        v,cur,anchor=self.edit_text_event(event,self.join_fields[k],self.join_cursor[k],self.join_anchor[k],18 if k=='name' else 512)
+                        v,cur,anchor=self.edit_text_event(event,self.join_fields[k],self.join_cursor[k],self.join_anchor[k],{'name':18,'title':24}.get(k,512))
                         self.join_fields[k]=v;self.join_cursor[k]=cur;self.join_anchor[k]=anchor
                     continue
                 if self.modal in ('notices','notice_zoom') and event.key in (
@@ -2168,7 +2220,7 @@ class Game(InternetRoomsMixin):
                     elif self.modal=='settings':self.do_action('settings_back',None)
                     elif self.modal=='notice_zoom':self.modal='notices'
                     elif self.modal is not None:
-                        if self.modal in ('join','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
+                        if self.modal in ('join','room_browser','name_edit','profile_edit'):pygame.key.stop_text_input();pygame.key.set_repeat()
                         self.close_overlay()
                     elif self.scene=='world':self.modal='pause'
                 elif self.modal=='story' and event.key in (pygame.K_e,pygame.K_SPACE,pygame.K_RETURN):
@@ -2223,10 +2275,13 @@ class Game(InternetRoomsMixin):
             elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
                 self.mouse=self.point(event.pos)
                 if self.modal=='join':
-                    for i,key in enumerate(('address','pin','name')):
+                    for i,key in enumerate(self.join_row_keys()):
                         if key not in self.join_edit_keys():continue
                         if pygame.Rect(264,238+i*112,748,57).collidepoint(self.mouse):
                             self.join_field=key;break
+                elif self.modal=='room_browser':
+                    for key,rect in (('name',(244,164,310,42)),('query',(570,164,358,42))):
+                        if pygame.Rect(rect).collidepoint(self.mouse):self.browser_field=key;break
                 if self.editor_click(self.mouse):
                     self.text_drag_kind=self.modal
                     info=self.editor_info()
@@ -2609,7 +2664,7 @@ class Game(InternetRoomsMixin):
                  ('村の依頼','報酬受取可能 '+str(sum(q['progress']>=q['target'] and not q['claimed'] for q in daily))+'件','daily_board'),
                  ('ログインボーナス','本日受取済み' if login_reward_view(self.state)['claimed'] else '本日分が受取可能','login_bonus'),
                  ('季節イベント',active_event()['name'] if active_event() else '開催待ち','event'),
-                 ('フレンド','申請 '+str(len(self.friend_invites))+'件','friends')]
+                 ('申請欄','届いた申請 '+str(len(self.pending_requests()))+'件','requests')]
         for i,(label,detail,action) in enumerate(entries):
             x=244+(i%2)*401;y=184+(i//2)*132
             box(self.stage,(x,y,378,113),CREAM,BROWN,6,2)
@@ -2768,7 +2823,7 @@ class Game(InternetRoomsMixin):
         self.ui_button((874,263,177,56),'セーブ枠','save_slots',size=18)
         self.ui_button((421,326,438,55),'新しい牧場を始める','newgame',size=24)
         self.ui_button((421,391,210,50),'協力部屋を作る','online_host_dialog',size=18)
-        self.ui_button((649,391,210,50),'オンライン参加','join_dialog',size=18)
+        self.ui_button((649,391,210,50),'部屋を探して参加','join_dialog',size=18)
         self.ui_button((421,452,210,49),'設定','settings',size=22)
         self.ui_button((649,452,210,49),'遊び方','overlay','help',size=22)
         self.ui_button((314,511,206,49),'メール / 贈り物','mail',size=17)
@@ -3230,7 +3285,7 @@ class Game(InternetRoomsMixin):
         text(self.stage,self.fonts,f'所持金 {self.state["coins"]} G',(640,589),23,BROWN,True,True)
 
     def draw_save_slots(self):
-        self.overlay_panel('セーブデータ管理 / 4 SLOTS','オフライン2枠・オンライン2枠。コピー元の通常セーブは残ります。')
+        self.overlay_panel('セーブデータ管理 / 4 SLOTS','既存データは保管できます。オンラインの進行は別の部屋専用牧場へ保存します。')
         summaries=slot_summaries()
         for i,(kind,number,status) in enumerate(summaries):
             y=165+i*105
@@ -3241,10 +3296,7 @@ class Game(InternetRoomsMixin):
             active=kind==self.slot_kind and number==self.slot_index
             self.ui_button((831,y+22,204,47),'使用中' if active else '選択 / 作成',
                            'slot_select',(kind,number),disabled=active,size=16)
-            if kind=='online' and status=='空き':
-                self.ui_button((596,y+22,102,47),'通常1→','slot_clone',(1,number),size=14)
-                self.ui_button((711,y+22,102,47),'通常2→','slot_clone',(2,number),size=14)
-        text(self.stage,self.fonts,'※別の枠を使う前に現在の牧場を保存してください。オンライン枠は不正対策の保証ではありません。',
+        text(self.stage,self.fonts,'通常・旧オンラインのセーブから、部屋へお金やアイテムを持ち込むことはできません。',
              (642,614),15,RED,False,True,max_width=820)
 
 
@@ -3360,21 +3412,20 @@ class Game(InternetRoomsMixin):
             self.ui_button((827,y+13,175,48),'受取済み' if claimed else '受け取る','mail_claim',m.get('id'),disabled=claimed,size=16)
 
     def draw_friends(self):
-        self.overlay_panel('フレンド  /  FRIENDS','同じ部屋で申請・承認すると、お互いのフレンド情報を保存できます。')
-        for i,p in enumerate(self.remote_players[:5]):
-            y=181+i*69
-            box(self.stage,(251,y,779,57),CREAM,BROWN,5,2)
-            text(self.stage,self.fonts,p['name'],(272,y+15),20,INK,True,max_width=280)
+        self.overlay_panel('フレンド  /  FRIENDS','「申請する」で相手の申請欄へ届きます。届いた申請は一覧で承認・見送りができます。')
+        self.ui_button((781,147,252,43),f'申請欄（{len(self.pending_requests())}）','requests',size=18)
+        text(self.stage,self.fonts,'同じ部屋の参加者',(258,158),19,BROWN,True)
+        for i,p in enumerate(self.remote_players[:7]):
+            y=206+i*51
+            box(self.stage,(251,y,779,46),CREAM,BROWN,5,2)
+            text(self.stage,self.fonts,p['name'],(272,y+11),18,INK,True,max_width=280)
             is_friend=p.get('uid') in self.state['friend_ids']
-            self.ui_button((625,y+7,142,43),'プロフィール','friend_profile',p.get('uid'),size=15)
-            self.ui_button((788,y+7,211,43),'フレンド登録済み' if is_friend else '申請する',
-                           'friend_request',p['id'],disabled=is_friend,size=16)
+            sent=p['id'] in self.friend_sent
+            self.ui_button((625,y+5,142,36),'プロフィール','friend_profile',p.get('uid'),size=14)
+            self.ui_button((788,y+5,211,36),'登録済み' if is_friend else ('申請済み' if sent else '申請する'),
+                           'friend_request',p['id'],disabled=is_friend or sent,size=16)
         if not self.remote_players:
             text(self.stage,self.fonts,'同じオンライン部屋の参加者はいません。',(640,246),19,INK,False,True)
-        if self.friend_invites:
-            invite=self.friend_invites[0]
-            text(self.stage,self.fonts,invite['name']+' から申請が届いています',(356,564),17,RED,True)
-            self.ui_button((817,547,187,49),'承認する','friend_accept',invite['id'],size=16)
         text(self.stage,self.fonts,'登録済み：'+('、'.join(self.state['friends'][:14]) or 'なし'),(263,634),15,GREEN_DARK,max_width=770)
         if not self.remote_players:
             cached=self.state.get('profile_cache',{})
@@ -3384,6 +3435,32 @@ class Game(InternetRoomsMixin):
                     info=cached[uid]
                     text(self.stage,self.fonts,info.get('name','フレンド'),(277,y+6),19,INK,True)
                     self.ui_button((767,y,232,39),'保存したプロフィール','friend_profile',uid,size=15)
+
+    def draw_requests(self):
+        self.overlay_panel('申請欄  /  REQUESTS','部屋への参加申請とフレンド申請がここに届きます。承認・見送りを選んでください。')
+        rows=self.pending_requests()
+        pages=max(1,(len(rows)+5)//6)
+        self.requests_page=min(self.requests_page,pages-1)
+        text(self.stage,self.fonts,f'届いた申請：{len(rows)}件',(246,159),20,BROWN,True)
+        self.ui_button((816,146,220,42),'フレンド一覧','friends',size=17)
+        if not rows:
+            text(self.stage,self.fonts,'届いている申請はありません。',(640,317),24,INK,False,True)
+            text(self.stage,self.fonts,'参加申請は「検索に表示する」で開いた部屋の部屋主へ届きます。',
+                 (640,373),16,GREEN_DARK,False,True,max_width=780)
+        for i,row in enumerate(rows[self.requests_page*6:self.requests_page*6+6]):
+            y=208+i*61
+            box(self.stage,(242,y,795,54),CREAM,BROWN,5,2)
+            kind='部屋への参加' if row['kind']=='join' else 'フレンド'
+            text(self.stage,self.fonts,kind+'申請',(258,y+7),13,GREEN_DARK)
+            text(self.stage,self.fonts,row['name'],(258,y+26),18,INK,True,max_width=400)
+            join=row['kind']=='join'
+            self.ui_button((733,y+8,132,38),'承認する','request_decide' if join else 'friend_accept',
+                           (row['id'],True) if join else row['id'],size=16)
+            self.ui_button((879,y+8,139,38),'見送る','request_decide' if join else 'friend_reject',
+                           (row['id'],False) if join else row['id'],size=16)
+        self.ui_button((492,610,83,37),'◀','requests_page',-1,disabled=self.requests_page==0,size=17)
+        text(self.stage,self.fonts,f'{self.requests_page+1} / {pages}',(640,620),17,BROWN,True,True)
+        self.ui_button((704,610,83,37),'▶','requests_page',1,disabled=self.requests_page>=pages-1,size=17)
 
     def draw_profile(self):
         own=self.profile_view_uid is None or self.profile_view_uid==self.state['player_uid']
@@ -3716,6 +3793,7 @@ class Game(InternetRoomsMixin):
         labels.append(('チャットを開く T','chat',None))
         labels.append(('みんなで共同出荷 G','coop_board',None))
         labels.append(('タイトルへ戻る','return_title',None))
+        labels.append((f'申請欄（{len(self.pending_requests())}）','requests',None))
         for i,(label,act,val) in enumerate(labels):
             x=241+(i%3)*281
             y=151+(i//3)*65
@@ -3861,14 +3939,49 @@ class Game(InternetRoomsMixin):
         text(self.stage,self.fonts,'※部屋ごとの協力目標。参加者に個別報酬。チャット合図で協力！',
              (640,646),15,GREEN_DARK,False,True)
 
+    def draw_room_browser(self):
+        self.overlay_panel('オンラインの部屋を探す','部屋名・部屋主名で検索できます。参加申請は部屋主が承認するとつながります。')
+        text(self.stage,self.fonts,'参加するときの名前',(244,143),14,BROWN,True)
+        text(self.stage,self.fonts,'部屋名・部屋主名で検索',(570,143),14,BROWN,True)
+        for key,rect in (('name',(244,164,310,42)),('query',(570,164,358,42))):
+            active=self.browser_field==key
+            box(self.stage,rect,WHITE,GOLD if active else BROWN,5,2)
+            if active:
+                self.draw_editor_line(self.browser_fields[key],self.browser_cursor[key],self.browser_anchor[key],
+                    rect[0]+16,rect[1]+10,rect[2]-32,18)
+            else:
+                text(self.stage,self.fonts,self.browser_fields[key],(rect[0]+16,rect[1]+10),18,INK,max_width=rect[2]-32)
+            self.register('browser_field',rect,key)
+        self.ui_button((943,164,94,42),'検索','room_search',disabled=self.directory_job is not None,size=17)
+        text(self.stage,self.fonts,self.directory_status,(244,221),15,GREEN_DARK,max_width=790)
+        pages=max(1,(len(self.directory_rows)+4)//5)
+        self.directory_page=min(self.directory_page,pages-1)
+        for i,row in enumerate(self.directory_rows[self.directory_page*5:self.directory_page*5+5]):
+            y=252+i*67
+            box(self.stage,(242,y,795,59),CREAM,BROWN,5,2)
+            text(self.stage,self.fonts,row['title'],(257,y+8),20,INK,True,max_width=420)
+            text(self.stage,self.fonts,'部屋主：'+row['host'],(258,y+36),14,GREEN_DARK,max_width=400)
+            text(self.stage,self.fonts,f'{row["players"]} / 8人',(720,y+21),17,BROWN,True)
+            full=row['players']>=8
+            self.ui_button((818,y+10,199,40),'満員' if full else '参加申請する','room_request',row['id'],disabled=full,size=17)
+        if not self.directory_rows and not self.directory_job:
+            text(self.stage,self.fonts,'部屋主が「検索に表示する」を選ぶと、ここに表示されます。',
+                 (640,358),18,INK,False,True,max_width=780)
+        self.ui_button((244,607,200,41),'部屋コードで参加','join_code_dialog',size=17)
+        self.ui_button((457,607,210,41),'自分の部屋を作る','online_host_dialog',size=17)
+        self.ui_button((716,609,69,37),'◀','browser_page',-1,disabled=self.directory_page==0,size=17)
+        text(self.stage,self.fonts,f'{self.directory_page+1}/{pages}',(841,619),16,BROWN,True,True)
+        self.ui_button((896,609,69,37),'▶','browser_page',1,disabled=self.directory_page>=pages-1,size=17)
+
     def draw_join(self):
         hosting=self.online_intent=='host'
         internet=self.join_mode=='internet'
         self.overlay_panel('協力部屋を作る' if hosting else '友達の部屋に参加',
-                           '部屋主が遊んでいる間、最大8人で協力できます。お金・所持品はプレイヤーごとに保存。')
+                           '最大8人。通常データの持ち込みなし。進行は部屋主の専用牧場に保存されます。')
         self.ui_button((264,154,360,37),('● ' if internet else '')+'インターネット / 部屋コード','online_mode','internet',size=16)
         self.ui_button((652,154,360,37),('● ' if not internet else '')+'同じLAN / IP指定','online_mode','lan',size=16)
-        info=[('address','中継サーバーURL（初回だけ入力）' if internet else 'ホストのIP:PORT 例 192.168.1.10:47821'),
+        info=[('address','中継サーバーURL（設定済み・通常は変更不要）' if internet else 'ホストのIP:PORT 例 192.168.1.10:47821'),
+              ('title','部屋名') if hosting and internet else
               ('pin','部屋コード（作成後に自動発行）' if hosting else ('部屋コード / コピーした招待' if internet else '部屋のPIN')),
               ('name','プレイヤー名')]
         for i,(key,caption) in enumerate(info):
@@ -3881,19 +3994,29 @@ class Game(InternetRoomsMixin):
             if active:self.draw_editor_line(value,self.join_cursor[key],self.join_anchor[key],282,y+45,710,22)
             else:text(self.stage,self.fonts,value,(282,y+45),22,INK,max_width=710)
             if editable:self.register('join_field',(264,y+31,748,57),key)
+        if hosting:
+            if internet:
+                self.ui_button((264,538,493,37),'検索に表示：'+('オン' if self.host_public else 'オフ')+'（参加は承認制）',
+                    'host_public',selected=self.host_public,size=16)
+            text(self.stage,self.fonts,'自分の牧場',(785,547),14,BROWN,True)
+            for n in (1,2):
+                self.ui_button((882+(n-1)*67,538,59,37),str(n),'host_world',n,selected=self.host_world_slot==n,size=17)
         if self.message and time.monotonic()<self.message_until:
-            text(self.stage,self.fonts,self.message,(640,539),15,RED,True,True,max_width=820)
-        self.ui_button((460,570,360,58),'部屋を作成する' if hosting else '部屋に参加する','join_room',size=23)
+            text(self.stage,self.fonts,self.message,(640,519 if hosting else 539),14,RED,True,True,max_width=820)
+        self.ui_button((460,584 if hosting else 570,360,50 if hosting else 58),
+                       '部屋を作成 / 再開' if hosting else '部屋に参加する','join_room',size=23)
         text(self.stage,self.fonts,'Ctrl+Vで招待を貼り付け / Tabで欄を切替 / Enterで接続 / Escで戻る',
              (640,650),15,GREEN_DARK,False,True)
 
     def draw_online_connect(self):
-        self.overlay_panel('友達との接続を準備しています','部屋に接続しています。Escでキャンセルできます。')
+        waiting=self.online_job and '承認' in self.online_job.progress
+        self.overlay_panel('参加申請を送信しました' if waiting else '友達との接続を準備しています',
+                           '待機中もEscで取り消せます。参加申請は部屋主の申請欄に表示されます。')
         dots='.'*(int(time.monotonic()*3)%4)
-        text(self.stage,self.fonts,'中継サーバーに接続中'+dots,(640,298),28,BROWN,True,True)
+        text(self.stage,self.fonts,('部屋主の承認待ち' if waiting else '中継サーバーに接続中')+dots,(640,298),28,BROWN,True,True)
         status=self.online_job.progress if self.online_job else '接続を準備しています'
         text(self.stage,self.fonts,status,(640,366),20,GREEN_DARK,False,True,max_width=820)
-        self.ui_button((460,478,360,58),'キャンセル','online_cancel',size=23)
+        self.ui_button((460,478,360,58),'申請を取り消す' if waiting else 'キャンセル','online_cancel',size=23)
 
     def apply_brightness(self):
         value=self.settings['brightness']
@@ -3916,6 +4039,8 @@ class Game(InternetRoomsMixin):
         if self.modal:
             self.buttons.clear()
             if self.modal=='join':self.draw_join()
+            elif self.modal=='room_browser':self.draw_room_browser()
+            elif self.modal=='requests':self.draw_requests()
             elif self.modal=='online_connect':self.draw_online_connect()
             elif self.modal=='interior':self.draw_interior()
             elif self.modal=='neighbor_town':self.draw_neighbor_town()
@@ -3999,6 +4124,7 @@ class Game(InternetRoomsMixin):
                 self.say(self.update_status,9);self.update_status=''
             self.render()
         if self.online_job:self.online_job.cancel();self.online_job=None
+        if self.directory_job:self.directory_job.cancel_event.set()
         if self.online_client:self.stop_online()
         elif self.scene=='world':self.persist(True)
         pygame.quit()
@@ -4044,7 +4170,7 @@ def main():
             probe.enter_area(OUTDOOR)
             for modal in ('chest','travel','map','shop','inventory','daily_board',
                           'login_bonus','notifications','decor','social','hud_settings','progression',
-                          'profile','mail','friends','event','avatars','save_slots',
+                          'profile','mail','friends','requests','room_browser','event','avatars','save_slots',
                           'neighbor_shop','arena','duel','fishing_wait'):
                 probe.modal=modal
                 probe.render()  # new screens, map and storage buttons

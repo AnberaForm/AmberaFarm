@@ -85,11 +85,11 @@ class RelayIntegrationTests(unittest.TestCase):
         self.temp.cleanup()
         self.assertTrue(wait_for(lambda: not self.running.relay.rooms), 'Relay leaked a room')
 
-    def room(self, name='Host'):
+    def room(self, name='Host', room_owned=False):
         state = new_state()
         state['player_name'] = name
         room = RoomServer(state, Path(self.temp.name) / f'{name}.json', port=0,
-                          bind='127.0.0.1', pin='123456')
+                          bind='127.0.0.1', pin='123456', room_owned=room_owned)
         self.resources.append(room)
         host = RoomClient(f'127.0.0.1:{room.port}', room.pin, name,
                           profile=state, host_token=room.host_token)
@@ -291,12 +291,13 @@ class RelayIntegrationTests(unittest.TestCase):
         from online_ui import ConnectionJob
         gate = threading.Event()
         started = threading.Event()
-        def delayed_relay(*args):
+        def delayed_relay(*args, **kwargs):
             started.set()
             gate.wait(3)
-            return RelayHost(*args)
-        with patch('online_ui.RelayHost', delayed_relay):
-            job = ConnectionJob('host', {'address': self.running.endpoint, 'pin': '', 'name': 'Host'},
+            return RelayHost(*args, **kwargs)
+        with patch('online_ui.RelayHost', delayed_relay), patch.dict(os.environ,{'APPDATA':self.temp.name}):
+            job = ConnectionJob('host', {'address': self.running.endpoint, 'pin': '', 'name': 'Host',
+                                        'world_file': Path(self.temp.name) / 'room.json'},
                                 new_state(), Path(self.temp.name) / 'profile.json', [])
             self.assertTrue(started.wait(3))
             job.cancel()
@@ -337,10 +338,10 @@ class RelayIntegrationTests(unittest.TestCase):
         self.assertEqual(result, ['cancelled'])
         self.assertLess(time.monotonic() - start, 1)
 
-    def test_pygame_guest_disconnect_keeps_wallet_and_original_farm(self):
+    def test_pygame_guest_disconnect_restores_original_save_without_carrying_items(self):
         from ambera_farm import Game, pygame
         from save_slots import load_slot
-        room, _, relay = self.room()
+        room, _, relay = self.room(room_owned=True)
         os.environ['SDL_VIDEODRIVER'] = 'dummy'
         os.environ['SDL_AUDIODRIVER'] = 'dummy'
         with patch.dict(os.environ, {'APPDATA': self.temp.name}), \
@@ -363,7 +364,8 @@ class RelayIntegrationTests(unittest.TestCase):
                     return game.online_client is not None and game.online_profile_received
                 self.assertTrue(wait_for(connected))
                 self.assertTrue(game.online_guest)
-                self.assertEqual(game.state['coins'], 73)
+                self.assertEqual(game.state['coins'], 200)
+                self.assertTrue(game.online_room_owned)
                 self.assertNotEqual(game.state['plots'], original)
                 with room.lock:
                     room.players[game.online_client.id]['profile']['coins'] = 419
@@ -377,7 +379,7 @@ class RelayIntegrationTests(unittest.TestCase):
                     return game.online_client is None
                 self.assertTrue(wait_for(disconnected))
                 saved, _ = load_slot('online', 1)
-                self.assertEqual(saved['coins'], 419)
+                self.assertEqual(saved['coins'], 73)
                 self.assertEqual(saved['plots'], original)
                 self.assertEqual(room.host_profile['coins'], 200)
             finally:
@@ -419,7 +421,9 @@ class RelayIntegrationTests(unittest.TestCase):
                 game.poll_internet_connection()
                 self.assertIsNone(game.online_client)
                 saved, _ = load_slot('online', 1)
-                self.assertEqual(saved['coins'], 317)
+                self.assertEqual(saved['coins'], 200)
+                from room_saves import load_room, room_file
+                self.assertEqual(load_room(room_file(1))[0]['coins'], 317)
                 self.assertFalse(game.online_room_code)
                 self.assertFalse(game.settings.get('online_room_code'))
             finally:

@@ -12,6 +12,7 @@ permissions:
 jobs:
   windows-release:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - name: Get source
         uses: actions/checkout@v4
@@ -58,12 +59,29 @@ jobs:
           python pack_windows_release.py --repo "$env:GITHUB_REPOSITORY" --version "$version"
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Build Japanese Setup installer
+        run: python build_windows_setup.py
+
+      - name: Verify install, shortcuts, launcher, update and uninstall
+        run: python verify_windows_setup.py
+
+      - name: Save installer verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmberaFarm-Setup-Verification
+          path: |
+            build_output/release/setup_verification.json
+            build_output/setup_logs/*.log
+
       - name: Upload standalone archive (manual builds)
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: AmberaFarm-Windows-TestBuild
-          path: build_output/release/AmberaFarm_Windows_v*.zip
+          path: |
+            build_output/release/AmberaFarm_Windows_v*.zip
+            build_output/release/AmberaFarm_Setup_v*.exe
 
       - name: Publish EXE distribution and update manifest
         if: github.ref_type == 'tag'
@@ -71,6 +89,7 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            build_output/release/AmberaFarm_Setup_v*.exe
             build_output/release/AmberaFarm_Windows_v*.zip
             build_output/release/AmberaFarm_payload_v*.zip
             build_output/release/update_manifest.json

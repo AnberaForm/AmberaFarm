@@ -21,7 +21,7 @@ VERSION=ROOT/'version.json'
 ALLOWED={
     'ambera_farm.py','farm_core.py','fishing_core.py','story_engine.py','story_editor.py',
     'world_map.py','multiplayer.py','updater.py','start_game.py',
-    'online_rooms.py','online_ui.py','online_config.json',
+    'online_rooms.py','online_ui.py','room_saves.py','online_config.json',
     'v8_features.py','player_movement.py','inventory_grid.py','profile_progress.py',
     'life_hub.py','town_features.py','coop_orders.py','farm_mailbox.py','notices.py',
     'kabuball_core.py','character_avatars.py','avatar_animation.py','area_world.py',
@@ -58,7 +58,9 @@ def get_config():
     try:
         value=json.loads(CONFIG.read_text(encoding='utf-8-sig'))
         return value if isinstance(value,dict) else {}
-    except (OSError,ValueError):return {}
+    except (OSError,ValueError):
+        return ({'auto_update':True,'manifest_url':'https://github.com/AnberaForm/AmberaFarm/releases/latest/download/update_manifest.json'}
+                if getattr(sys,'frozen',False) else {})
 
 def _url(value):
     from urllib.parse import urlsplit

@@ -20,7 +20,7 @@ jobs:
       - name: Install verification dependencies
         run: python -m pip install -r requirements-build.txt
       - name: Check local relay integration
-        run: python -m unittest -q verify_online_rooms
+        run: python -m unittest -q verify_online_rooms verify_room_lobby
       - name: Check published WSS relay
         run: python verify_public_relay.py --report build_output/public_relay_check.json
       - name: Save verification report

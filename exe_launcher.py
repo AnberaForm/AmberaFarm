@@ -37,6 +37,7 @@ UPDATE_FILES = frozenset(('app/AmberaGame.exe', 'app/AmberaStoryEditor.exe', 've
 REQUIRED_FILES = UPDATE_FILES
 GAME_RELATIVE = Path('app') / 'AmberaGame.exe'
 LOCK_HANDLE = None
+DEFAULT_MANIFEST = 'https://github.com/AnberaForm/AmberaFarm/releases/latest/download/update_manifest.json'
 
 
 def base_dir() -> Path:
@@ -107,7 +108,22 @@ def read_config(root: Path) -> dict:
         config = json.loads((root / 'update_config.json').read_text(encoding='utf-8-sig'))
         return config if isinstance(config, dict) else {}
     except (OSError, ValueError):
-        return {}
+        return ({'auto_update':True,'manifest_url':DEFAULT_MANIFEST}
+                if getattr(sys,'frozen',False) else {})
+
+
+def hide_metadata(root: Path) -> None:
+    if sys.platform!='win32':return
+    import ctypes
+    kernel=ctypes.windll.kernel32
+    kernel.GetFileAttributesW.argtypes=[ctypes.c_wchar_p]
+    kernel.GetFileAttributesW.restype=ctypes.c_uint32
+    kernel.SetFileAttributesW.argtypes=[ctypes.c_wchar_p,ctypes.c_uint32]
+    for name in ('version.json','update_config.json'):
+        path=root/name
+        if path.is_file():
+            attrs=kernel.GetFileAttributesW(str(path))
+            if attrs!=0xffffffff:kernel.SetFileAttributesW(str(path),attrs|2)
 
 
 def require_https(url: str) -> str:
@@ -221,6 +237,8 @@ def apply_update(root: Path, zip_path: Path, version: str) -> None:
     try:
         with zipfile.ZipFile(zip_path, 'r') as archive:
             infos = list_payload(archive, version)
+            if not (root/'app'/'AmberaStoryEditor.exe').exists():
+                infos=[info for info in infos if info.filename!='app/AmberaStoryEditor.exe']
             for entry in infos:
                 dst = stage / entry.filename
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -237,6 +255,7 @@ def apply_update(root: Path, zip_path: Path, version: str) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(stage / entry.filename, dest)
             modified.append(entry.filename)
+        hide_metadata(root)
         log('Updated game files to version ' + version)
     except Exception:
         for name in reversed(modified):
@@ -281,17 +300,19 @@ def main() -> int:
         return 0
     root = base_dir()
     log('Launcher started: ' + str(root))
-    status = check_update(root)
+    smoke='--smoke-test' in sys.argv
+    status = 'smoke-test' if smoke else check_update(root)
     log('Update status: ' + status)
     executable = root / GAME_RELATIVE
     if not executable.is_file():
-        alert('Game files were not found. Extract the entire distribution ZIP.\n'
+        alert('Game files were not found. Run the AmberaFarm Setup again.\n'
               f'Missing: {executable}\nLog: {profile_dir() / "exe_launcher.log"}')
         log('Game executable missing')
         return 1
     try:
         # Wait for game exit, so double-clicking cannot install while game is in use.
-        result = subprocess.run([str(executable)], cwd=str(executable.parent), check=False)
+        result = subprocess.run([str(executable)]+(['--smoke-test'] if smoke else []),
+                                cwd=str(executable.parent), check=False)
         log('Game exited with code ' + str(result.returncode))
         return result.returncode
     except OSError as exc:

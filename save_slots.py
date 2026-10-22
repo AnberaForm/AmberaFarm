@@ -7,7 +7,7 @@ trusted remotely hosted account service; see SECURITY_AND_SAVES.md.
 from __future__ import annotations
 from pathlib import Path
 import shutil
-import hashlib, hmac, secrets, os, uuid
+import hashlib, hmac, secrets, os
 from farm_core import SaveError, state_path, load_state, save_state, load_json, new_state
 from v8_features import init_v8
 
@@ -88,19 +88,8 @@ def new_slot(kind,index,root=None):
     return path
 
 def import_offline_to_online(offline_index,online_index,root=None):
-    """Copy (not move) one selected offline character to one EMPTY online slot."""
-    src=slot_file('offline',offline_index,root)
-    dest=slot_file('online',online_index,root)
-    if dest.exists():raise SaveError('オンライン枠は空き枠を選択してください。')
-    if not src.exists():raise SaveError('コピー元の通常セーブがありません。')
-    state=init_v8(load_json(src))
-    # A copied character receives a distinct online identity per slot, preventing
-    # collisions if the player imports the same offline character twice.
-    state['player_uid']=uuid.uuid4().hex
-    state['friend_ids']=[]
-    state['profile_cache']={}
-    save_slot(state,'online',online_index,root)
-    return dest
+    """Kept as a failing compatibility entry point; no save can be imported."""
+    raise SaveError('通常データはオンラインへ持ち込めません。部屋専用データで始まります。')
 
 def delete_slot(kind,index,root=None):
     path=slot_file(kind,index,root)
