@@ -15,6 +15,7 @@ import traceback
 ROOT = Path(__file__).resolve().parent
 LOG = ROOT / 'launcher_log.txt'
 PKG = 'pygame-ce==2.5.8'
+ONLINE_PKG = 'websocket-client==1.9.2'
 
 
 def report(message: str) -> None:
@@ -114,6 +115,18 @@ def main() -> int:
             return 1
         python = str(venv_python)
         report('[OK] pygame-ce is ready.')
+
+    try:
+        online_ready = subprocess.run([python, '-c', 'import websocket'],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      timeout=15, check=False).returncode == 0
+        if not online_ready:
+            status = run_command([python, '-m', 'pip', 'install', '--disable-pip-version-check',
+                                  '--only-binary=:all:', '--no-input', '--timeout', '5', '--retries', '0', ONLINE_PKG],
+                                 '[SETUP] Installing online room support')
+            if status:report('[WARN] Online rooms unavailable; offline and LAN play are still available.')
+    except (OSError, subprocess.SubprocessError):
+        report('[WARN] Could not prepare online rooms; offline and LAN play are still available.')
 
     if not (ROOT / 'ambera_farm.py').is_file() or not (ROOT / 'farm_core.py').is_file():
         report('[ERROR] Missing game files. Extract all ZIP files to a normal folder.')

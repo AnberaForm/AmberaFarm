@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ambera-farm-relay
+    runtime: python
+    plan: free
+    region: singapore
+    numInstances: 1
+    buildCommand: pip install -r requirements-relay.txt
+    startCommand: python relay_server.py
+    healthCheckPath: /health
+    autoDeployTrigger: "off"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: AMBERA_MAX_ROOMS
+        value: 20
