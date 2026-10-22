@@ -43,7 +43,9 @@ jobs:
       - name: Verify packaged administrator app
         shell: pwsh
         run: |
-          $result = Start-Process -FilePath build_output/admin/AmberaStoryEditor.exe -ArgumentList '--admin-smoke-test --report-dir build_output/admin_ui_packaged' -PassThru -Wait
+          $result = Start-Process -FilePath build_output/admin/AmberaStoryEditor.exe -ArgumentList '--admin-smoke-test --report-dir build_output/admin_ui_packaged' -PassThru
+          if (-not $result.WaitForExit(90000)) { Stop-Process -Id $result.Id -Force; throw 'Packaged admin check exceeded 90 seconds' }
+          $result.Refresh()
           if ($result.ExitCode -ne 0) { throw "Admin UI check failed: $($result.ExitCode)" }
           $report = Get-Content build_output/admin_ui_packaged/admin_ui_verification.json -Raw | ConvertFrom-Json
           if ($report.status -ne 'passed') { throw 'Admin UI verification report did not pass' }
