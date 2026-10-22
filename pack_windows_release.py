@@ -52,7 +52,7 @@ def pack(exe_folder: Path, output: Path, repo: str, version: str):
             '2. Double click AmberaFarm.exe (NOT app/AmberaGame.exe).\r\n'
             '3. The launcher checks for updates on every start, then starts the game.\r\n'
             '4. Admin editor is separate; it is not distributed to players.\r\n'
-            '5. Save data: %%APPDATA%%\\AmberaFarm\\save.json.\r\n'
+            '5. Save data: %APPDATA%\\AmberaFarm\\save_slots\\ (offline and online slots).\r\n'
             '6. Game works offline. Failed updates do not block offline play.\r\n'
             'Online co-op: private room codes through a configured WSS relay; LAN also supported.\r\n'
             f'Build: v{version}\r\n').encode('ascii'))

@@ -3,7 +3,7 @@
 【この版の変更】
 離れた友達と部屋コードで参加できるWSS中継方式を追加。
 接続待ちのキャンセル、招待のコピー・貼り付け、切断時の保存に対応。
-インターネット接続には中継サーバーの配置とURL設定が必要です。
+公開済みの中継サーバーを設定済みです。URLの手入力は不要です。
 導入は V9_5_ONLINE_GUIDE.md を参照してください。
 
 【引き継いだ機能】
@@ -40,7 +40,7 @@ T: チャット（室内・隣町も可）    C: 衣装    F9: 緊急脱出    F
 通常2枠＋オンライン2枠。通常データは空きオンライン枠へコピーできます。
 「インターネット / 部屋コード」「同じLAN / IP指定」を選べます。
 部屋主を含め8人まで。部屋主が起動している間に参加できます。
-中継サーバーの公開URLはまだ未設定です。配置後に設定してください。
+公開済みの中継サーバーへ接続します。接続先はonline_config.jsonに同梱しています。
 室内と隣町では同じ場所にいる参加者だけを表示します。
 詳細は V9_5_ONLINE_GUIDE.md と SECURITY_AND_SAVES.md を参照してください。
 
@@ -57,6 +57,7 @@ python -m unittest -q verify_online_rooms
 python ambera_farm.py --smoke-test
 python verify_release_tag.py --tag v9.5.0
 実行結果は VALIDATION_V9_5_0.txt を参照。
-WindowsのEXE起動・実機操作・別PC間の通信は、この作成環境では未検証です。
+Windows版のビルド・通信の検証結果はVALIDATION_V9_5_0.txtを参照してください。
+別々のPC・回線での実操作は確認が必要です。
 
 履歴: V9_2_RELEASE_NOTES.md / V9_1_LIFE_UI_RELEASE_NOTES.md / V9_0_RELEASE_NOTES.md
