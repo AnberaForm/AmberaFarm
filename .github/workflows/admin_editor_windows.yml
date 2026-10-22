@@ -2,42 +2,77 @@ name: Build Ambera Farm Admin Editor EXE
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the verified admin tool separately from the game'
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
 
 jobs:
   admin-editor:
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 15
     steps:
       - name: Get source
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.13'
           architecture: 'x64'
-
       - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt pillow
+      - name: Check admin data validation and publishing boundaries
+        run: python -m pytest -q tests/test_fishing_story.py tests/test_notices_distribution.py tests/test_feature_integrations.py
+      - name: Verify real administrator UI with temporary drafts
+        run: python verify_admin_ui.py --report-dir build_output/admin_ui_source
+      - name: Build administrator tool only
+        run: >-
+          python -m PyInstaller --clean --noconfirm --onefile --windowed
+          --name AmberaStoryEditor --distpath build_output/admin
+          --workpath build_output/admin_work --specpath build_output/admin_work
+          --add-data "${{ github.workspace }}/data/story_events.json:data"
+          --add-data "${{ github.workspace }}/data/announcements.json:data"
+          --add-data "${{ github.workspace }}/version.json:." story_editor.py
+      - name: Verify packaged administrator app
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-build.txt
-
-      - name: Build Windows EXEs using existing verified build script
-        shell: pwsh
-        run: |
-          python build_windows.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Test-Path 'build_output/exe/AmberaStoryEditor.exe')) {
-            throw 'AmberaStoryEditor.exe not created'
-          }
-
-      - name: Upload admin editor EXE as Actions artifact only
+          $result = Start-Process -FilePath build_output/admin/AmberaStoryEditor.exe -ArgumentList '--admin-smoke-test --report-dir build_output/admin_ui_packaged' -PassThru
+          if (-not $result.WaitForExit(90000)) { Stop-Process -Id $result.Id -Force; throw 'Packaged admin check exceeded 90 seconds' }
+          $result.Refresh()
+          if ($result.ExitCode -ne 0) { throw "Admin UI check failed: $($result.ExitCode)" }
+          $report = Get-Content build_output/admin_ui_packaged/admin_ui_verification.json -Raw | ConvertFrom-Json
+          if ($report.status -ne 'passed') { throw 'Admin UI verification report did not pass' }
+      - name: Save UI screenshots and verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmberaFarm-AdminUI-Verification
+          path: |
+            build_output/admin_ui_source
+            build_output/admin_ui_packaged
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Save administrator executable
         uses: actions/upload-artifact@v4
         with:
           name: AmberaFarm-AdminEditor-Windows
-          path: build_output/exe/AmberaStoryEditor.exe
+          path: build_output/admin/AmberaStoryEditor.exe
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
+      - name: Publish separate administrator download
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Copy-Item build_output/admin_ui_packaged/01-home.png build_output/admin/AmberaAdmin_Preview.png
+          Compress-Archive -Path build_output/admin_ui_packaged/* -DestinationPath build_output/admin/AmberaAdmin_UI_Previews.zip
+          gh release create admin-ui-v1.0.0 build_output/admin/AmberaStoryEditor.exe build_output/admin/AmberaAdmin_Preview.png build_output/admin/AmberaAdmin_UI_Previews.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title '管理者ツール UI更新 v1.0.0' --notes-file ADMIN_UI_GUIDE.md --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
