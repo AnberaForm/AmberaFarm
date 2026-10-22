@@ -32,21 +32,19 @@ def test_old_single_save_is_copied_and_left_untouched(tmp_path):
     assert not legacy_migrate(tmp_path/'slots',legacy)
 
 
-def test_online_clone_not_move(tmp_path):
+def test_offline_import_is_rejected_and_original_is_untouched(tmp_path):
     root=tmp_path/'slots'
     new_slot('offline',1,root)
     original,_=load_slot('offline',1,root)
     original['coins']=91
     save_slot(original,'offline',1,root)
-    import_offline_to_online(1,1,root)
-    online,_=load_slot('online',1,root)
-    assert online['coins']==91
-    assert online['player_uid']!=original['player_uid']
-    online['coins']=11
-    save_slot(online,'online',1,root)
+    before=slot_file('offline',1,root).read_bytes()
+    with pytest.raises(SaveError,match='持ち込めません'):
+        import_offline_to_online(1,1,root)
+    assert not slot_file('online',1,root).exists()
+    assert slot_file('offline',1,root).read_bytes()==before
     offline,_=load_slot('offline',1,root)
     assert offline['coins']==91
-    with pytest.raises(SaveError):import_offline_to_online(1,1,root)
 
 
 def test_hmac_detects_plain_json_edit(tmp_path):
