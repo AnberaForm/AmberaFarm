@@ -24,6 +24,8 @@ def run(report_dir):
                 screens.append(path.name)
             try:
                 root.update();screen('01-home')
+                button=app.home_download;home=app.pages['home']
+                check(button.winfo_rooty()+button.winfo_height()<=home.winfo_rooty()+home.winfo_height()-10,'Home download link fits the available window height')
                 expected=json.loads((Path(story_editor.__file__).resolve().parent/'version.json').read_text(encoding='utf-8-sig'))['version']
                 check(app.distribution_admin.version.get()==expected,'Standalone tool shows bundled game version')
                 for page in ('story','notice','mail','release'):

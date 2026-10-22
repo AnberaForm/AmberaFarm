@@ -151,10 +151,11 @@ class StoryEditor:
                 ('お知らせを届ける','下書きを保存し、公開対象を確認してGitHubへ公開します。','notice'),
                 ('アイテムを配布','配布内容を編集し、全プレイヤー向けのメールを公開します。','mail'),
                 ('ゲームを配布・更新','Setupの配布ページ、ビルド結果、新しいリリースを管理します。','release')]:
-            card=ttk.LabelFrame(home,text=title);card.pack(fill='x',pady=7)
+            card=ttk.LabelFrame(home,text=title,padding=8);card.pack(fill='x',pady=5)
             ttk.Button(card,text='開く →',command=lambda k=key:self.show_page(k)).pack(side='right',padx=8)
             ttk.Label(card,text=description,wraplength=650).pack(anchor='w',pady=5)
-        ttk.Button(home,text='公開中のダウンロードページ',command=lambda:webbrowser.open(RELEASES_URL)).pack(anchor='w',pady=14)
+        self.home_download=ttk.Button(home,text='公開中のダウンロードページ',command=lambda:webbrowser.open(RELEASES_URL))
+        self.home_download.pack(anchor='w',pady=6)
 
     def form_values(self):
         return tuple(v.get() for v in (self.id_v,self.title_v,self.speaker_v,self.npc_v,self.kind_v,self.stat_v,self.count_v,self.flag_v))+(self.lines.get('1.0','end-1c'),)
