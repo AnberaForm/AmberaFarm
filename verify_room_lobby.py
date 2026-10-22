@@ -122,10 +122,12 @@ class LobbyTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda:not relay.pending_requests()))
 
     def test_cancellation_withdraws_request_without_host_decision(self):
+        from online_rooms import withdraw_request
         _,_,relay=self.room()
-        ws,_=self.request(relay)
-        _abort(ws)
-        self.assertTrue(wait_for(lambda:not relay.pending_requests()))
+        for cancel in (withdraw_request, _abort):
+            ws,_=self.request(relay)
+            cancel(ws)
+            self.assertTrue(wait_for(lambda:not relay.pending_requests()))
 
     def test_closed_host_notifies_waiting_guest(self):
         _,_,relay=self.room()

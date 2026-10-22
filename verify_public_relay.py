@@ -11,7 +11,7 @@ from pathlib import Path
 
 from farm_core import new_state
 from multiplayer import RoomClient, RoomServer, PROTOCOL
-from online_rooms import RelayHost, RelayError, connect_guest, search_rooms, _websocket, _reply, _abort
+from online_rooms import RelayHost, RelayError, connect_guest, search_rooms, withdraw_request, _websocket, _reply, _abort
 from room_saves import load_room, member_key
 from online_ui import wait_for_relay
 from area_world import NEIGHBOR
@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix='ambera_public_probe_') as folder:
         withdrawn.send(json.dumps({'op':'request','version':1,'protocol':PROTOCOL,'code':relay.code,'name':'取消確認'}))
         pending=_reply(withdrawn)
         check(until(lambda:any(r['id']==pending['id'] for r in relay.pending_requests())),'Pending request reaches host inbox')
-        _abort(withdrawn)
+        withdraw_request(withdrawn)
         check(until(lambda:all(r['id']!=pending['id'] for r in relay.pending_requests())),'Cancelled request is removed from host inbox')
         guests = []
         identities=[]
