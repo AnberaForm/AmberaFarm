@@ -13,6 +13,7 @@ def run(report_dir):
     def check(value,name):
         if not value:raise AssertionError(name)
         checks.append(name)
+        (report_dir/'admin_ui_progress.txt').write_text('\n'.join(checks),encoding='utf-8')
     with tempfile.TemporaryDirectory(prefix='ambera_admin_ui_') as folder:
         with patch.dict(os.environ,{'APPDATA':folder}),patch.object(story_editor,'USER',Path(folder)/'story_events.json'),patch('tkinter.messagebox.showinfo'),patch('tkinter.messagebox.showerror',side_effect=lambda *a,**k:errors.append(a)),patch('tkinter.messagebox.askyesno',return_value=True),patch('tkinter.messagebox.askyesnocancel',return_value=None):
             app=story_editor.StoryEditor();root=app.root

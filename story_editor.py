@@ -339,9 +339,15 @@ def login_and_open():
 if __name__ == '__main__':
     import sys
     if '--admin-smoke-test' in sys.argv:
-        from verify_admin_ui import run
         target=sys.argv[sys.argv.index('--report-dir')+1] if '--report-dir' in sys.argv else 'build_output/admin_ui_checks'
-        run(target)
+        try:
+            from verify_admin_ui import run
+            run(target)
+        except BaseException:
+            import traceback
+            folder=Path(target);folder.mkdir(parents=True,exist_ok=True)
+            (folder/'admin_ui_failure.txt').write_text(traceback.format_exc(),encoding='utf-8')
+            sys.exit(1)
     else:
         login_and_open()
 
