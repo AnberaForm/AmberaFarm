@@ -16,7 +16,7 @@ env:
 
 jobs:
   admin-editor:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 15
     steps:
       - name: Get source
