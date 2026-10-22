@@ -253,9 +253,13 @@ class RelayIntegrationTests(unittest.TestCase):
     def test_host_leaving_closes_guest_and_invalidates_room(self):
         room, _, relay = self.room()
         guest = self.guest(relay)
+        control = self.running.relay.rooms[relay.code].control
         relay.close()
         self.assertTrue(wait_for(lambda: not guest.active))
         self.assertTrue(wait_for(lambda: relay.code not in self.running.relay.rooms))
+        # Proxies can retain upstream TCP after an abrupt socket abort. The
+        # close frame must reach the real relay, not just end the local reader.
+        self.assertEqual(control.close_code, 1000)
         with self.assertRaises(ConnectionError):
             self.guest(relay)
 

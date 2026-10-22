@@ -103,6 +103,13 @@ def _abort(ws):
         ws.abort()
     except Exception:
         pass
+    # send_close() marks the WebSocket disconnected before returning, so its
+    # abort() can skip the still-blocking socket reader. Always wake it too.
+    try:
+        if ws.sock is not None:
+            ws.sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
     # close() may return early after recv() marked a peer disconnected. shutdown()
     # also releases that underlying socket, and never waits for a close handshake.
     try:
@@ -204,6 +211,7 @@ class RelayHost:
         self.lock = threading.Lock()
         self.links = set()
         self.active = False
+        self._closing = False
         self.control = _websocket(self.endpoint)
         try:
             self.control.send(json.dumps({'op': 'create', 'version': RELAY_PROTOCOL,
@@ -292,11 +300,22 @@ class RelayHost:
                 self.links.discard(local)
 
     def close(self):
-        self.active = False
-        _abort(self.control)
         with self.lock:
+            if self._closing:
+                return
+            self._closing = True
+            self.active = False
             links = list(self.links)
             self.links.clear()
+        # A managed proxy may keep its upstream socket alive after a bare TCP
+        # abort. Send the WebSocket close frame so the relay removes the room
+        # and disconnects guests immediately, without waiting for its heartbeat.
+        try:
+            self.control.settimeout(.25)
+            self.control.send_close()
+        except Exception:
+            pass
+        _abort(self.control)
         for link in links:
             if isinstance(link, socket.socket):
                 try:
