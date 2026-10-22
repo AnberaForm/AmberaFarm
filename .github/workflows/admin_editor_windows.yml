@@ -3,6 +3,10 @@ name: Build Ambera Farm Admin Editor EXE
 on:
   workflow_dispatch:
     inputs:
+      admin_version:
+        description: 'Administrator tool version (does not change game version)'
+        type: string
+        default: '1.0.1'
       publish:
         description: 'Publish the verified admin tool separately from the game'
         type: boolean
@@ -71,8 +75,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          ADMIN_VERSION: ${{ inputs.admin_version }}
         run: |
+          if ($env:ADMIN_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid administrator version' }
           Copy-Item build_output/admin_ui_packaged/01-home.png build_output/admin/AmberaAdmin_Preview.png
           Compress-Archive -Path build_output/admin_ui_packaged/* -DestinationPath build_output/admin/AmberaAdmin_UI_Previews.zip
-          gh release create admin-ui-v1.0.0 build_output/admin/AmberaStoryEditor.exe build_output/admin/AmberaAdmin_Preview.png build_output/admin/AmberaAdmin_UI_Previews.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title '管理者ツール UI更新 v1.0.0' --notes-file ADMIN_UI_GUIDE.md --prerelease --latest=false
+          gh release create "admin-ui-v$env:ADMIN_VERSION" build_output/admin/AmberaStoryEditor.exe build_output/admin/AmberaAdmin_Preview.png build_output/admin/AmberaAdmin_UI_Previews.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "管理者ツール UI更新 v$env:ADMIN_VERSION" --notes-file ADMIN_UI_GUIDE.md --prerelease --latest=false
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
