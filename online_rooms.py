@@ -212,6 +212,7 @@ class RelayHost:
         self.links = set()
         self.active = False
         self._closing = False
+        self._control_done = threading.Event()
         self.control = _websocket(self.endpoint)
         try:
             self.control.send(json.dumps({'op': 'create', 'version': RELAY_PROTOCOL,
@@ -234,8 +235,12 @@ class RelayHost:
 
     def _listen(self):
         try:
-            while self.active:
+            while True:
                 message = _reply(self.control)
+                if message.get('type') == 'closed':
+                    break
+                if not self.active:
+                    continue
                 ticket = message.get('ticket', '')
                 if (message.get('type') != 'incoming' or not isinstance(ticket, str)
                         or not re.fullmatch(r'[0-9a-f]{48}', ticket)):
@@ -244,6 +249,7 @@ class RelayHost:
         except (OSError, ValueError):
             pass
         finally:
+            self._control_done.set()
             self.close()
 
     def _track(self, link):
@@ -307,15 +313,20 @@ class RelayHost:
             self.active = False
             links = list(self.links)
             self.links.clear()
-        # A managed proxy may keep its upstream socket alive after a bare TCP
-        # abort. Send the WebSocket close frame so the relay removes the room
-        # and disconnects guests immediately, without waiting for its heartbeat.
-        try:
-            self.control.settimeout(.25)
-            self.control.send_close()
-        except Exception:
-            pass
-        _abort(self.control)
+        # Ask the relay to close the room at application level. A reverse proxy
+        # can keep the upstream alive after the local TCP socket is gone. Wait
+        # for the acknowledgement away from Pygame's main thread.
+        def finish_control():
+            try:
+                self.control.settimeout(1)
+                self.control.send(json.dumps({'op': 'leave'}))
+                self._control_done.wait(2)
+                self.control.send_close()
+            except Exception:
+                pass
+            finally:
+                _abort(self.control)
+        threading.Thread(target=finish_control, daemon=True).start()
         for link in links:
             if isinstance(link, socket.socket):
                 try:
