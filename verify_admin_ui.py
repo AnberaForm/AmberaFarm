@@ -24,6 +24,8 @@ def run(report_dir):
                 screens.append(path.name)
             try:
                 root.update();screen('01-home')
+                expected=json.loads((Path(story_editor.__file__).resolve().parent/'version.json').read_text(encoding='utf-8-sig'))['version']
+                check(app.distribution_admin.version.get()==expected,'Standalone tool shows bundled game version')
                 for page in ('story','notice','mail','release'):
                     app.show_page(page);root.update();check(app.pages[page].winfo_ismapped(),page+' navigation opens');screen('02-'+page)
                 app.show_page('story');root.update();app.title_v.set('編集中のお話');app.load(0) if app.index is None else None
@@ -45,7 +47,7 @@ def run(report_dir):
                 notices.add();notices.title_v.set('切り替え前のお知らせ');notices.list.selection_clear(0,'end');notices.list.selection_set(1);notices.choose()
                 check(any(n['title']=='切り替え前のお知らせ' for n in notices.feed['notices']),'Notice selection retains unsaved edit')
                 mail=app.mail_admin;mail.add();mail.vars['coins'].set('125');mail.vars['title'].set('下書きプレゼント');check(mail.save(),'Mail edits save without duplicate insertion')
-                check(json.loads(mail_admin.draft_path().read_text())['campaigns'][0]['coins']==125,'Mail draft stores edited rewards')
+                check(json.loads(mail_admin.draft_path().read_text(encoding='utf-8'))['campaigns'][0]['coins']==125,'Mail draft stores edited rewards')
                 mail.vars['coins'].set('999');check(not mail.save(),'Out of range rewards rejected');errors.clear();mail.load(0)
                 mail.preview();root.update()
                 for child in root.winfo_children():

@@ -23,6 +23,15 @@ from notices import (REPO, RELEASES_URL, TYPES, draft_path, load_draft, read_fee
 TYPE_LABELS = {'news':'一般のお知らせ','update':'アップデート','event':'イベント','maintenance':'メンテナンス'}
 
 
+def admin_game_version():
+    from pathlib import Path
+    try:
+        value=json.loads((Path(__file__).resolve().parent/'version.json').read_text(encoding='utf-8-sig'))['version']
+        if isinstance(value,str) and re.fullmatch(r'\d+\.\d+\.\d+',value):return value
+    except (OSError,ValueError,KeyError,TypeError):pass
+    return current_version()
+
+
 def run_gh(*arguments):
     if not shutil.which('gh'):
         raise RuntimeError('GitHub CLI が見つかりません。https://cli.github.com/ からインストールしてください。')
@@ -269,7 +278,7 @@ class DistributionTab:
         ttk.Label(parent,textvariable=self.status,wraplength=780,style='Muted.TLabel').pack(side='bottom',anchor='w',pady=8)
         steps=ttk.LabelFrame(parent,text='新しいバージョンを公開する手順');steps.pack(fill='x',pady=6)
         ttk.Label(steps,text='1. 更新するソースをGitHubのmainへ反映\n2. version.jsonと同じバージョン・変更内容を入力\n3. 公開後にビルド成功とSetupの追加を確認',justify='left').pack(anchor='w')
-        self.version=tk.StringVar(value=current_version());field(parent,'公開するバージョン（例：9.6.1）',self.version)
+        self.version=tk.StringVar(value=admin_game_version());field(parent,'公開するバージョン（例：9.6.1）',self.version)
         ttk.Label(parent,text='変更内容 / リリースノート（3500文字まで）').pack(anchor='w',pady=(12,4));self.notes=text_area(parent,height=8)
         ttk.Label(parent,text='GitHub CLIでの認証が必要です。ソースのアップロードはこの画面では行いません。',wraplength=780,style='Muted.TLabel').pack(anchor='w',pady=8)
         self.saved=(self.version.get(),'')
