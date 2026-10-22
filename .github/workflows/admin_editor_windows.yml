@@ -70,5 +70,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create admin-ui-v1.0.0 build_output/admin/AmberaStoryEditor.exe --repo ${{ github.repository }} --target ${{ github.sha }} --title '管理者ツール UI更新 v1.0.0' --notes-file ADMIN_UI_GUIDE.md --prerelease --latest=false
+          Copy-Item build_output/admin_ui_packaged/01-home.png build_output/admin/AmberaAdmin_Preview.png
+          Compress-Archive -Path build_output/admin_ui_packaged/* -DestinationPath build_output/admin/AmberaAdmin_UI_Previews.zip
+          gh release create admin-ui-v1.0.0 build_output/admin/AmberaStoryEditor.exe build_output/admin/AmberaAdmin_Preview.png build_output/admin/AmberaAdmin_UI_Previews.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title '管理者ツール UI更新 v1.0.0' --notes-file ADMIN_UI_GUIDE.md --prerelease --latest=false
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
