@@ -37,9 +37,9 @@ jobs:
           python -m PyInstaller --clean --noconfirm --onefile --windowed
           --name AmberaStoryEditor --distpath build_output/admin
           --workpath build_output/admin_work --specpath build_output/admin_work
-          --add-data "data/story_events.json:data"
-          --add-data "data/announcements.json:data"
-          --add-data "version.json:." story_editor.py
+          --add-data "${{ github.workspace }}/data/story_events.json:data"
+          --add-data "${{ github.workspace }}/data/announcements.json:data"
+          --add-data "${{ github.workspace }}/version.json:." story_editor.py
       - name: Verify packaged administrator app
         shell: pwsh
         run: |
