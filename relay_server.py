@@ -236,7 +236,9 @@ class RelayServer:
                 await self._send(ws, decision.result())
             elif watcher in done:
                 # Disconnect/cancel withdraws the request immediately.
-                try:watcher.result()
+                try:
+                    watcher.result()
+                    await self._send(ws, {'type': 'cancelled'})
                 except ConnectionClosed:pass
             else:
                 await self._error(ws, 'request_timeout')

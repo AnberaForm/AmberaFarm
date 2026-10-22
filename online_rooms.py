@@ -145,6 +145,7 @@ def request_admission(endpoint, code, name, protocol, cancelled, progress, max_w
     """Wait off the render thread; a closing socket withdraws a pending request."""
     import websocket
     ws = _websocket(endpoint)
+    granted = False
     try:
         ws.send(json.dumps({'op': 'request', 'version': RELAY_PROTOCOL,
                             'protocol': protocol, 'code': code, 'name': str(name)[:18]}))
@@ -163,10 +164,26 @@ def request_admission(endpoint, code, name, protocol, cancelled, progress, max_w
                     or not re.fullmatch(r'[0-9a-f]{64}', reply['approval'])):
                 raise ConnectionError('承認情報の形式が違います。')
             format_code(code, reply.get('pin'))
+            granted = True
             return reply
         if cancelled.is_set():
             raise ConnectionError('参加申請を取り消しました。')
         raise RelayError('request_timeout')
+    finally:
+        if not granted:
+            withdraw_request(ws)
+        else:
+            _abort(ws)
+
+
+def withdraw_request(ws):
+    """Withdraw explicitly: a proxy may delay propagation of a TCP abort."""
+    try:
+        ws.settimeout(2)
+        ws.send(json.dumps({'op': 'cancel'}))
+        ws.recv()  # Wait for the relay acknowledgement before closing transport.
+    except Exception:
+        pass
     finally:
         _abort(ws)
 
