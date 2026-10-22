@@ -12,7 +12,8 @@ MUTED = '#64766d'
 
 def theme(root):
     root.configure(bg=BG)
-    root.option_add('*Font', ('Meiryo', 10))
+    from tkinter import font
+    font.nametofont('TkDefaultFont', root=root).configure(family='Meiryo', size=10)
     root.option_add('*Listbox.background', '#ffffff')
     root.option_add('*Listbox.foreground', INK)
     root.option_add('*Listbox.selectBackground', '#d8e9dd')
@@ -76,6 +77,15 @@ def list_area(parent):
     box.configure(yscrollcommand=bar.set)
     bar.pack(side='right', fill='y'); box.pack(fill='both', expand=True)
     return box
+
+
+def form_enabled(parent, enabled):
+    for widget in parent.winfo_children():
+        if isinstance(widget, ttk.Combobox):
+            widget.configure(state='readonly' if enabled else 'disabled')
+        elif isinstance(widget, (ttk.Entry, ttk.Checkbutton, tk.Text)):
+            widget.configure(state='normal' if enabled else 'disabled')
+        form_enabled(widget, enabled)
 
 
 class ScrollForm(ttk.Frame):

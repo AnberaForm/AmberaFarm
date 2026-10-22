@@ -49,7 +49,7 @@ class MailAdminTab:
             btn=ttk.Button(footer,text=title,command=cb,style=style);btn.pack(side='right',padx=3);self.actions.append(btn)
         ttk.Label(parent,textvariable=self.status,style='Muted.TLabel',wraplength=780).pack(side='bottom',anchor='w',pady=(8,0))
         body=ttk.Panedwindow(parent,orient='horizontal');body.pack(fill='both',expand=True)
-        left=ttk.Frame(body,width=280);right=ttk.Frame(body,padding=(18,0));body.add(left,weight=1);body.add(right,weight=2)
+        left=ttk.Frame(body,width=280);right=ttk.Frame(body,padding=(18,0));self.form=right;body.add(left,weight=1);body.add(right,weight=2)
         self.query=tk.StringVar();ttk.Entry(left,textvariable=self.query).pack(fill='x',pady=(0,6))
         ttk.Label(left,text='件名・配布IDで検索',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
         self.list=list_area(left);self.list.bind('<<ListboxSelect>>',self.choose)
@@ -66,6 +66,9 @@ class MailAdminTab:
         for var in self.vars.values():var.trace_add('write',self.changed)
         self.query.trace_add('write',lambda *args:self.refresh());self.refresh()
         if self.items:self.load(0)
+        else:
+            from admin_ui import form_enabled
+            form_enabled(self.form,False);self.status.set('「新規追加」から配布メールを作成してください')
         if error:self.status.set('下書きを読み込めません。保存前にバックアップを確認してください。')
 
     def values(self):return tuple(v.get() for v in self.vars.values())
@@ -85,6 +88,8 @@ class MailAdminTab:
         if not self.apply():self.refresh();return
         self.load(index)
     def load(self,index):
+        from admin_ui import form_enabled
+        form_enabled(self.form,True)
         self.loading=True;self.index=index
         for key,var in self.vars.items():var.set(str(self.items[index][key]))
         self.baseline=self.values();self.loading=False;self.refresh();self.changed()
@@ -108,7 +113,10 @@ class MailAdminTab:
         if not messagebox.askyesno('削除の確認','選択した配布メールを下書きから削除しますか？\n公開情報の変更には再度公開が必要です。',parent=self.parent):return
         index=self.index;self.items.pop(index);self.index=None
         if self.items:self.load(min(index,len(self.items)-1))
-        else:self.refresh();self.changed()
+        else:
+            self.refresh();self.changed()
+            from admin_ui import form_enabled
+            form_enabled(self.form,False)
     def save(self,silent=False):
         if not self.apply():return False
         try:save_draft({'schema':1,'campaigns':self.items})
@@ -122,6 +130,9 @@ class MailAdminTab:
         def done(feed):
             save_draft(feed);self.items=feed['campaigns'];self.saved=copy.deepcopy(self.items);self.index=None;self.query.set('');self.refresh()
             if self.items:self.load(0)
+            else:
+                from admin_ui import form_enabled
+                form_enabled(self.form,False)
             self.status.set(f'公開情報を{len(self.items)}件読み込みました')
         self.task.run('公開情報を読み込み',work,done,self.actions)
     def preview(self):

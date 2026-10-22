@@ -116,7 +116,7 @@ class NoticeAdminTab:
             button=ttk.Button(footer,text=title,command=callback,style=style);button.pack(side='right',padx=3);self.actions.append(button)
         ttk.Label(parent,textvariable=self.status,style='Muted.TLabel',wraplength=780).pack(side='bottom',anchor='w',pady=(8,0))
         body=ttk.Panedwindow(parent,orient='horizontal');body.pack(fill='both',expand=True)
-        left=ttk.Frame(body,width=270);scroll=ScrollForm(body);body.add(left,weight=1);body.add(scroll,weight=3);right=scroll.content
+        left=ttk.Frame(body,width=270);scroll=ScrollForm(body);body.add(left,weight=1);body.add(scroll,weight=3);right=scroll.content;self.form=right
         self.query=tk.StringVar();ttk.Entry(left,textvariable=self.query).pack(fill='x',pady=(0,6))
         ttk.Label(left,text='タイトル・種類・IDで検索',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
         self.list=list_area(left);self.list.bind('<<ListboxSelect>>',self.choose)
@@ -140,6 +140,9 @@ class NoticeAdminTab:
         self.body.bind('<<Modified>>',self.body_changed)
         self.refresh()
         if self.feed['notices']:self.load(0)
+        else:
+            from admin_ui import form_enabled
+            form_enabled(self.form,False);self.status.set('「追加」からお知らせを作成してください')
 
     def values(self):
         return tuple(v.get() for v in (self.id_v,self.title_v,self.category_v,self.date_v,self.url_v,self.published_v,self.pinned_v))+(self.body.get('1.0','end-1c'),)
@@ -172,6 +175,8 @@ class NoticeAdminTab:
         self.load(index)
 
     def load(self,index):
+        from admin_ui import form_enabled
+        form_enabled(self.form,True)
         self.loading=True;self.index=index;n=self.feed['notices'][index]
         for var,key in ((self.id_v,'id'),(self.title_v,'title'),(self.category_v,'category'),(self.date_v,'published_at'),(self.url_v,'url'),(self.published_v,'published'),(self.pinned_v,'pinned')):var.set(n[key])
         self.body.delete('1.0','end');self.body.insert('1.0',n['body']);self.body.edit_modified(False)
@@ -201,7 +206,10 @@ class NoticeAdminTab:
         if not messagebox.askyesno('削除の確認','選択したお知らせを下書き一覧から削除しますか？\n公開済みの内容への反映には、再度公開が必要です。',parent=self.parent):return
         index=self.index;self.feed['notices'].pop(index);self.index=None
         if self.feed['notices']:self.load(min(index,len(self.feed['notices'])-1))
-        else:self.refresh();self.body.delete('1.0','end');self.changed()
+        else:
+            self.refresh();self.body.delete('1.0','end');self.changed()
+            from admin_ui import form_enabled
+            form_enabled(self.form,False)
 
     def save(self,silent=False):
         import copy
@@ -238,6 +246,9 @@ class NoticeAdminTab:
         def done(feed):
             self.feed=feed;save_feed(draft_path(),feed);self.saved=copy.deepcopy(feed);self.index=None;self.query.set('');self.refresh()
             if feed['notices']:self.load(0)
+            else:
+                from admin_ui import form_enabled
+                form_enabled(self.form,False)
             self.status.set('公開情報を読み込みました')
         self.task.run('公開情報を読み込み',fetch_public,done,self.actions)
 

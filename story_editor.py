@@ -61,7 +61,9 @@ class StoryEditor:
         from admin_ui import theme, heading, field, Choice, ScrollForm, list_area, text_area
         import copy
         self.root=tk.Tk(); self.root.title('アンベラ牧場｜管理者ツール')
-        self.root.geometry('1240x840'); self.root.minsize(1000,650); theme(self.root)
+        width=max(1000,min(1240,self.root.winfo_screenwidth()-40))
+        height=max(650,min(840,self.root.winfo_screenheight()-120))
+        self.root.geometry(f'{width}x{height}+10+10'); self.root.minsize(1000,650); theme(self.root)
         self.events=load_story(story_path()); self.saved_events=copy.deepcopy(self.events)
         self.index=None; self.loading=False; self.form_baseline=None
         self.status=tk.StringVar(value='準備できました')
@@ -88,7 +90,7 @@ class StoryEditor:
         ttk.Label(footer,textvariable=self.story_status,style='Muted.TLabel').pack(side='left')
         body=ttk.Panedwindow(main,orient='horizontal'); body.pack(fill='both',expand=True)
         left=ttk.Frame(body,width=280); scroll=ScrollForm(body); body.add(left,weight=1); body.add(scroll,weight=3)
-        right=scroll.content
+        right=scroll.content;self.form=right
         self.query=tk.StringVar(); ttk.Entry(left,textvariable=self.query).pack(fill='x',pady=(0,8))
         ttk.Label(left,text='タイトル・NPC・IDで絞り込み',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
         self.list=list_area(left); self.list.bind('<<ListboxSelect>>',self.select)
@@ -119,6 +121,9 @@ class StoryEditor:
         self.query.trace_add('write',self.filter_changed)
         self.refresh()
         if self.events:self.load(0)
+        else:
+            from admin_ui import form_enabled
+            form_enabled(self.form,False);self.story_status.set('「追加」からお話を作成してください')
         self.condition_changed();self.build_home()
         self.root.bind('<Control-s>',self.shortcut_save)
         self.root.protocol('WM_DELETE_WINDOW',self.close)
@@ -190,6 +195,8 @@ class StoryEditor:
         self.load(index)
 
     def load(self,index):
+        from admin_ui import form_enabled
+        form_enabled(self.form,True)
         self.loading=True;self.index=index;e=self.events[index]
         for v,k in ((self.id_v,'id'),(self.title_v,'title'),(self.speaker_v,'speaker'),(self.npc_v,'npc')):v.set(e.get(k,''))
         t=e.get('trigger',{'kind':'always'})
@@ -238,6 +245,8 @@ class StoryEditor:
         if self.events:self.load(min(index,len(self.events)-1))
         else:
             self.refresh();self.lines.delete('1.0','end');self.mark_dirty()
+            from admin_ui import form_enabled
+            form_enabled(self.form,False)
 
     def shift(self,delta):
         if self.index is None or not self.apply():return
