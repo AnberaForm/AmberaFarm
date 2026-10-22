@@ -118,9 +118,13 @@ class RelayServer:
         self.creators[address] = self.creators.get(address, 0) + 1
         try:
             await self._send(ws, {'type': 'created', 'code': code, 'key': room.key})
-            # Control is receive-only. WebSocket ping/pong provides liveness.
-            async for _ in ws:
-                await ws.close(code=1008, reason='Unexpected control message')
+            # Only the authenticated host control connection can end this room.
+            # Ping/pong still detects hosts that disappear without a leave.
+            async for raw in ws:
+                if isinstance(raw, str) and len(raw) <= 64 and json.loads(raw) == {'op': 'leave'}:
+                    await self._send(ws, {'type': 'closed'})
+                else:
+                    await ws.close(code=1008, reason='Unexpected control message')
                 break
         finally:
             self.rooms.pop(code, None)
@@ -130,8 +134,17 @@ class RelayServer:
             for pair in list(room.tickets.values()):
                 if not pair.done():
                     pair.cancel()
-            await asyncio.gather(*(s.close(code=1001, reason='Host left')
-                                   for s in list(room.guests | room.tunnels)), return_exceptions=True)
+            async def end_stream(peer):
+                # Empty binary data is the transport's EOF. Send it through the
+                # data channel before the WebSocket close handshake so guests
+                # also stop promptly when a proxy delays close propagation.
+                try:
+                    await asyncio.wait_for(peer.send(b''), 1)
+                except (ConnectionClosed, asyncio.TimeoutError):
+                    pass
+                await peer.close(code=1001, reason='Host left')
+            await asyncio.gather(*(end_stream(s) for s in list(room.guests | room.tunnels)),
+                                 return_exceptions=True)
 
     async def _join(self, ws, data):
         code, pin = data.get('code'), data.get('pin')

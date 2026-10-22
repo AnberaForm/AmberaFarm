@@ -103,6 +103,13 @@ def _abort(ws):
         ws.abort()
     except Exception:
         pass
+    # send_close() marks the WebSocket disconnected before returning, so its
+    # abort() can skip the still-blocking socket reader. Always wake it too.
+    try:
+        if ws.sock is not None:
+            ws.sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
     # close() may return early after recv() marked a peer disconnected. shutdown()
     # also releases that underlying socket, and never waits for a close handshake.
     try:
@@ -204,6 +211,8 @@ class RelayHost:
         self.lock = threading.Lock()
         self.links = set()
         self.active = False
+        self._closing = False
+        self._control_done = threading.Event()
         self.control = _websocket(self.endpoint)
         try:
             self.control.send(json.dumps({'op': 'create', 'version': RELAY_PROTOCOL,
@@ -226,8 +235,12 @@ class RelayHost:
 
     def _listen(self):
         try:
-            while self.active:
+            while True:
                 message = _reply(self.control)
+                if message.get('type') == 'closed':
+                    break
+                if not self.active:
+                    continue
                 ticket = message.get('ticket', '')
                 if (message.get('type') != 'incoming' or not isinstance(ticket, str)
                         or not re.fullmatch(r'[0-9a-f]{48}', ticket)):
@@ -236,6 +249,7 @@ class RelayHost:
         except (OSError, ValueError):
             pass
         finally:
+            self._control_done.set()
             self.close()
 
     def _track(self, link):
@@ -292,11 +306,27 @@ class RelayHost:
                 self.links.discard(local)
 
     def close(self):
-        self.active = False
-        _abort(self.control)
         with self.lock:
+            if self._closing:
+                return
+            self._closing = True
+            self.active = False
             links = list(self.links)
             self.links.clear()
+        # Ask the relay to close the room at application level. A reverse proxy
+        # can keep the upstream alive after the local TCP socket is gone. Wait
+        # for the acknowledgement away from Pygame's main thread.
+        def finish_control():
+            try:
+                self.control.settimeout(1)
+                self.control.send(json.dumps({'op': 'leave'}))
+                self._control_done.wait(2)
+                self.control.send_close()
+            except Exception:
+                pass
+            finally:
+                _abort(self.control)
+        threading.Thread(target=finish_control, daemon=True).start()
         for link in links:
             if isinstance(link, socket.socket):
                 try:
