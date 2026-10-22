@@ -17,7 +17,7 @@ def build(destination=None):
     recovered = require_pixel_assets(BASE)
     print(f'Pixel asset layout ready: 12/12 images; recovered {len(recovered)} files.', flush=True)
     # Root-level preflight also works when GitHub browser uploads flatten folders.
-    subprocess.run([sys.executable, '-m', 'unittest', '-q', 'verify_online_rooms'],
+    subprocess.run([sys.executable, '-m', 'unittest', '-q', 'verify_online_rooms', 'verify_room_lobby'],
                    cwd=BASE, check=True)
     destination = Path(destination or BASE / 'build_output').resolve()
     destination.mkdir(parents=True, exist_ok=True)

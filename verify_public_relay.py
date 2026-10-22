@@ -11,7 +11,8 @@ from pathlib import Path
 
 from farm_core import new_state
 from multiplayer import RoomClient, RoomServer, PROTOCOL
-from online_rooms import RelayHost, connect_guest
+from online_rooms import RelayHost, RelayError, connect_guest, search_rooms, _websocket, _reply, _abort
+from room_saves import load_room, member_key
 from online_ui import wait_for_relay
 from area_world import NEIGHBOR
 from scene_maps import NEIGHBOR_STORE
@@ -51,33 +52,88 @@ with tempfile.TemporaryDirectory(prefix='ambera_public_probe_') as folder:
         state = new_state()
         state.update(player_name='DeployHost', coins=117)
         room = RoomServer(state, Path(folder) / 'host.json', port=0,
-                          bind='127.0.0.1', pin=f'{secrets.randbelow(1000000):06d}')
+                          bind='127.0.0.1', pin=f'{secrets.randbelow(1000000):06d}',room_owned=True)
         resources.append(room)
         host = RoomClient(f'127.0.0.1:{room.port}', room.pin, 'DeployHost',
                           profile=state, host_token=room.host_token)
         clients.append(host)
-        relay = RelayHost(ENDPOINT, room.port, room.pin, PROTOCOL)
+        title='通信テスト_'+secrets.token_hex(4)
+        relay = RelayHost(ENDPOINT, room.port, room.pin, PROTOCOL,title=title,name='通信確認',public=True)
         resources.append(relay)
-        check(relay.active and len(relay.code) == 8, 'Public WSS private room creation')
+        check(relay.active and len(relay.code) == 8, 'Public WSS searchable room creation')
+        rows=search_rooms(ENDPOINT,title,PROTOCOL)
+        check(len(rows)==1 and rows[0]['id']==relay.code and set(rows[0])=={'id','title','host','players','max_players'},
+              'Room search returns matching room without invitation secrets')
+        try:
+            bad=connect_guest(ENDPOINT,relay.code,relay.pin,PROTOCOL)
+        except RelayError as exc:
+            check(exc.code=='approval_required','Public room requires host approval even with correct PIN')
+        else:
+            bad.close()
+            raise AssertionError('Public room admitted an unapproved guest')
+
+        def admission(name,accept=True):
+            ws=_websocket(ENDPOINT)
+            try:
+                ws.send(json.dumps({'op':'request','version':1,'protocol':PROTOCOL,'code':relay.code,'name':name}))
+                pending=_reply(ws)
+                assert pending['type']=='pending'
+                assert until(lambda:any(r['id']==pending['id'] for r in relay.pending_requests()))
+                relay.decide(pending['id'],accept)
+                return _reply(ws)
+            finally:_abort(ws)
+
+        rejected=False
+        try:admission('見送り確認',False)
+        except RelayError as exc:rejected=exc.code=='rejected'
+        check(rejected,'Host rejection reaches applicant')
+        withdrawn=_websocket(ENDPOINT)
+        withdrawn.send(json.dumps({'op':'request','version':1,'protocol':PROTOCOL,'code':relay.code,'name':'取消確認'}))
+        pending=_reply(withdrawn)
+        check(until(lambda:any(r['id']==pending['id'] for r in relay.pending_requests())),'Pending request reaches host inbox')
+        _abort(withdrawn)
+        check(until(lambda:all(r['id']!=pending['id'] for r in relay.pending_requests())),'Cancelled request is removed from host inbox')
         guests = []
+        identities=[]
         for name, coins in [('DeployGuestA', 83), ('DeployGuestB', 41)]:
             profile = new_state()
             profile['coins'] = coins
-            transport = connect_guest(ENDPOINT, relay.code, relay.pin, PROTOCOL)
+            grant=admission(name)
+            check(grant['type']=='approved','Host approves '+name)
+            transport = connect_guest(ENDPOINT, relay.code, relay.pin, PROTOCOL,approval=grant['approval'])
+            identity=secrets.token_hex(32)
+            identities.append(identity)
             guest = RoomClient('relay', relay.pin, name, profile=profile,
-                               connection=transport)
+                               connection=transport,identity=identity)
             clients.append(guest)
             guests.append(guest)
         check(until(lambda: len(room.players) == 3), 'Two guests via Render WSS to loopback host')
-        for guest, coins in zip(guests, [83, 41]):
+        for guest in guests:
             packets = []
 
             def personal_snapshot():
                 packets.extend(guest.poll())
-                return any(p.get('type') == 'snapshot' and p['state']['coins'] == coins
+                return any(p.get('type') == 'snapshot' and p['state']['coins'] == 200
                            and all('coins' not in x for x in p['players']) for p in packets)
 
-            check(until(personal_snapshot), f'Private wallet snapshot {coins}')
+            check(until(personal_snapshot), 'Room starter wallet ignores client save and hides other balances')
+        check(room.host_profile['coins']==200,'Host cannot bring personal save balance into room')
+        with room.lock:
+            room.players[guests[0].id]['profile']['coins']=319
+            room._save_host()
+        guests[0].close()
+        check(until(lambda:guests[0].id not in room.players),'Guest disconnect saved by host')
+        grant=admission('DeployGuestA')
+        transport=connect_guest(ENDPOINT,relay.code,relay.pin,PROTOCOL,approval=grant['approval'])
+        rejoined=RoomClient('relay',relay.pin,'DeployGuestA',connection=transport,identity=identities[0])
+        clients.append(rejoined);guests[0]=rejoined
+        packets=[]
+        def resumed():
+            packets.extend(rejoined.poll())
+            return any(p.get('type')=='snapshot' and p['state']['coins']==319 for p in packets)
+        check(until(resumed),'Returning guest resumes only progress earned in this farm')
+        check(load_room(Path(folder)/'host.json')[1][member_key(identities[0])]['coins']==319,
+              'Room progress persisted on host, not imported from guest PC')
         guests[0].chat('公開サーバー接続確認')
         packets = []
 

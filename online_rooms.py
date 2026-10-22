@@ -10,6 +10,7 @@ import json
 import re
 import socket
 import threading
+import time
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 RELAY_PROTOCOL = 1
@@ -78,10 +79,25 @@ def _websocket(endpoint, timeout=8):
         raise ConnectionError('中継サーバーに接続できません。URLと通信状態を確認してください。') from exc
 
 
-def _reply(ws):
+class RelayError(ConnectionError):
+    def __init__(self, code):
+        self.code = code
+        messages = {'not_found': '部屋が見つかりません。部屋主の接続を確認してください。',
+                    'denied': '部屋コードが違います。', 'full': '部屋は満員です。',
+                    'busy': '中継サーバーが混雑しています。少し待ってからお試しください。',
+                    'timeout': '部屋主への接続が間に合いませんでした。もう一度お試しください。',
+                    'version': '通信バージョンが違います。全員が最新版を使用してください。',
+                    'rejected': '部屋主が参加申請を見送りました。',
+                    'host_left': '部屋主が部屋を閉じました。',
+                    'requests_full': '参加申請が混み合っています。少し待ってからお試しください。',
+                    'request_timeout': '承認待ちが終了しました。もう一度申請できます。',
+                    'approval_required': 'この部屋には部屋主の承認が必要です。'}
+        super().__init__(messages.get(code, '中継サーバーが接続を拒否しました。'))
+
+
+def _decode_reply(raw):
     try:
-        raw = ws.recv()
-        if not isinstance(raw, str) or len(raw) > 2048:
+        if not isinstance(raw, str) or len(raw) > MAX_FRAME:
             raise ValueError
         reply = json.loads(raw)
         if not isinstance(reply, dict):
@@ -89,13 +105,70 @@ def _reply(ws):
     except Exception as exc:
         raise ConnectionError('中継サーバーの応答を受信できませんでした。') from exc
     if reply.get('type') == 'error':
-        messages = {'not_found': '部屋が見つかりません。コードと部屋主の接続を確認してください。',
-                    'denied': '部屋コードが違います。', 'full': '部屋は満員です。',
-                    'busy': '中継サーバーが混雑しています。少し待ってからお試しください。',
-                    'timeout': '部屋主への接続が間に合いませんでした。もう一度お試しください。',
-                    'version': '通信バージョンが違います。全員が最新版を使用してください。'}
-        raise ConnectionError(messages.get(reply.get('code'), '中継サーバーが接続を拒否しました。'))
+        raise RelayError(reply.get('code'))
     return reply
+
+
+def _reply(ws):
+    try:
+        raw = ws.recv()
+    except Exception as exc:
+        raise ConnectionError('中継サーバーの応答を受信できませんでした。') from exc
+    return _decode_reply(raw)
+
+
+def search_rooms(endpoint, query, protocol):
+    ws = _websocket(endpoint)
+    try:
+        ws.send(json.dumps({'op': 'list', 'version': RELAY_PROTOCOL,
+                            'protocol': protocol, 'query': str(query)[:40]}))
+        reply = _reply(ws)
+        rows = reply.get('rooms')
+        if reply.get('type') != 'rooms' or not isinstance(rows, list) or len(rows) > 100:
+            raise ConnectionError('部屋一覧を読み込めませんでした。')
+        clean = []
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get('id'), str)
+                    or len(row['id']) != 8 or any(c not in CODE_ALPHABET for c in row['id'])
+                    or not isinstance(row.get('title'), str) or len(row['title']) > 24
+                    or not isinstance(row.get('host'), str) or len(row['host']) > 18
+                    or type(row.get('players')) is not int or not 1 <= row['players'] <= 8
+                    or row.get('max_players') != 8):
+                raise ConnectionError('部屋一覧の形式が違います。')
+            clean.append({k: row[k] for k in ('id', 'title', 'host', 'players', 'max_players')})
+        return clean
+    finally:
+        _abort(ws)
+
+
+def request_admission(endpoint, code, name, protocol, cancelled, progress, max_wait=185):
+    """Wait off the render thread; a closing socket withdraws a pending request."""
+    import websocket
+    ws = _websocket(endpoint)
+    try:
+        ws.send(json.dumps({'op': 'request', 'version': RELAY_PROTOCOL,
+                            'protocol': protocol, 'code': code, 'name': str(name)[:18]}))
+        pending = _reply(ws)
+        if pending.get('type') != 'pending':
+            raise ConnectionError('参加申請を送信できませんでした。')
+        progress('参加申請を送りました。部屋主の承認を待っています（最大3分）')
+        ws.settimeout(1)
+        until = time.monotonic() + max_wait
+        while not cancelled.is_set() and time.monotonic() < until:
+            try:
+                reply = _decode_reply(ws.recv())
+            except (websocket.WebSocketTimeoutException, socket.timeout):
+                continue
+            if (reply.get('type') != 'approved' or not isinstance(reply.get('approval'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', reply['approval'])):
+                raise ConnectionError('承認情報の形式が違います。')
+            format_code(code, reply.get('pin'))
+            return reply
+        if cancelled.is_set():
+            raise ConnectionError('参加申請を取り消しました。')
+        raise RelayError('request_timeout')
+    finally:
+        _abort(ws)
 
 
 def _abort(ws):
@@ -189,11 +262,11 @@ class RelaySocket:
         _abort(self.ws)
 
 
-def connect_guest(endpoint, code, pin, protocol):
+def connect_guest(endpoint, code, pin, protocol, approval=None):
     ws = _websocket(endpoint)
     try:
         ws.send(json.dumps({'op': 'join', 'version': RELAY_PROTOCOL, 'protocol': protocol,
-                            'code': code, 'pin': str(pin)}))
+                            'code': code, 'pin': str(pin), 'approval': approval}))
         if _reply(ws).get('type') != 'connected':
             raise ConnectionError('部屋に接続できませんでした。')
         return RelaySocket(ws)
@@ -203,20 +276,23 @@ def connect_guest(endpoint, code, pin, protocol):
 
 
 class RelayHost:
-    def __init__(self, endpoint, local_port, pin, protocol):
+    def __init__(self, endpoint, local_port, pin, protocol, title='', name='', public=False):
         self.endpoint = relay_url(endpoint)
         self.local_port = int(local_port)
         self.pin = str(pin)
         self.protocol = protocol
         self.lock = threading.Lock()
         self.links = set()
+        self.requests = {}
         self.active = False
         self._closing = False
         self._control_done = threading.Event()
         self.control = _websocket(self.endpoint)
         try:
             self.control.send(json.dumps({'op': 'create', 'version': RELAY_PROTOCOL,
-                                          'protocol': protocol, 'pin': self.pin}))
+                                          'protocol': protocol, 'pin': self.pin,
+                                          'title': str(title)[:24], 'name': str(name)[:18],
+                                          'public': bool(public)}))
             reply = _reply(self.control)
             if reply.get('type') != 'created':
                 raise ConnectionError('部屋コードを作成できませんでした。')
@@ -241,6 +317,20 @@ class RelayHost:
                     break
                 if not self.active:
                     continue
+                if message.get('type') == 'join_request':
+                    request = message.get('request')
+                    if (not isinstance(request, dict) or not isinstance(request.get('id'), str)
+                            or not re.fullmatch(r'[0-9a-f]{24}', request['id'])
+                            or not isinstance(request.get('name'), str) or len(request['name']) > 18):
+                        raise ConnectionError('Invalid admission request')
+                    with self.lock:
+                        if len(self.requests) < 16:
+                            self.requests[request['id']] = dict(request)
+                    continue
+                if message.get('type') == 'request_removed':
+                    with self.lock:
+                        self.requests.pop(message.get('id'), None)
+                    continue
                 ticket = message.get('ticket', '')
                 if (message.get('type') != 'incoming' or not isinstance(ticket, str)
                         or not re.fullmatch(r'[0-9a-f]{48}', ticket)):
@@ -251,6 +341,22 @@ class RelayHost:
         finally:
             self._control_done.set()
             self.close()
+
+    def pending_requests(self):
+        with self.lock:
+            return [dict(r) for r in self.requests.values()]
+
+    def decide(self, request_id, accept):
+        with self.lock:
+            if not self.active or request_id not in self.requests:
+                return False
+        def send():
+            try:
+                self.control.send(json.dumps({'op': 'decide', 'id': request_id, 'accept': bool(accept)}))
+            except Exception:
+                self.close()
+        threading.Thread(target=send, daemon=True).start()
+        return True
 
     def _track(self, link):
         with self.lock:
@@ -313,6 +419,7 @@ class RelayHost:
             self.active = False
             links = list(self.links)
             self.links.clear()
+            self.requests.clear()
         # Ask the relay to close the room at application level. A reverse proxy
         # can keep the upstream alive after the local TCP socket is gone. Wait
         # for the acknowledgement away from Pygame's main thread.
