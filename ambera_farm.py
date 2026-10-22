@@ -52,6 +52,7 @@ from world_map import (BUILDINGS, TREE_POSITIONS, INTERACTION_POINTS, fence_at, 
                        path_at, plaza_at, flower_at, district_at, TRAVEL_STOPS, nearest_travel_stop, blocked as map_blocked,
                        can_stand, plot_world as map_plot_world)
 from multiplayer import RoomServer, RoomClient, PORT
+from online_ui import InternetRoomsMixin
 from player_movement import (move_character, safe_destination, walkable_short_path,
                              reconcile_prediction, MovementTrail, interpolate_around_obstacles)
 from updater import current_version, get_config, fetch_manifest
@@ -329,7 +330,7 @@ def settings_file():
 def load_settings():
     initial = {'volume': 45, 'brightness': 100, 'resolution': 1, 'fullscreen': False, 'fps_limit': 60,
                'hud_inventory_visible': True, 'quick_quest_visible': True, 'inventory_layout': [],
-               'slot_kind':'offline','slot_index':1}
+               'slot_kind':'offline','slot_index':1,'online_relay_url':''}
     try:
         data = json.loads(settings_file().read_text(encoding='utf-8-sig'))
         if isinstance(data, dict):
@@ -417,7 +418,7 @@ class SoundBank:
             self.sounds[name].play()
 
 
-class Game:
+class Game(InternetRoomsMixin):
     def __init__(self):
         pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=1024)
         pygame.init()
@@ -578,6 +579,7 @@ class Game:
         self.show_performance = False
         self.join_fields = {'address':'127.0.0.1:47821','pin':'','name':self.state['player_name']}
         self.join_field = 'address'
+        self.init_internet_rooms((EXTERNAL_ROOT, EXTERNAL_ROOT.parent, ROOT), store_settings)
         self.online_profile_received = False
         self.chat_log = []
         self.chat_last_seq = 0
@@ -789,6 +791,11 @@ class Game:
             self.say(f'部屋の作成に失敗: {exc}',15)
 
     def join_room(self):
+        if self.join_mode=='internet':
+            self.begin_internet_connection();return
+        if self.online_intent=='host':
+            pygame.key.stop_text_input();pygame.key.set_repeat()
+            self.start_room();return
         if self.slot_kind!='online':
             self.modal='save_slots';self.say('オンラインセーブ枠を選択してください。',9);return
         if self.online_client:return
@@ -828,6 +835,9 @@ class Game:
             return False
 
     def stop_online(self):
+        if self.online_relay:
+            self.online_relay.close()
+            self.online_relay=None
         if self.online_guest:
             self.save_guest_profile(True)
         if self.online_client:
@@ -865,6 +875,8 @@ class Game:
         self.movement_trail.clear()
         self.last_move_ack = -1
         self.room_pin = ''
+        self.online_room_code = ''
+        self.online_endpoint = ''
         self.chat_log = []
         self.chat_last_seq = 0
         self.chat_text = ''
@@ -1266,6 +1278,8 @@ class Game:
             if key<=seq:self.scene_sent.pop(key,None)
 
     def close_overlay(self):
+        if self.modal=='online_connect':
+            self.cancel_internet_connection();return
         if self.modal in ('fishing','fishing_wait','fishing_result') and self.online_client:
             self.online_client.action('fish_cancel',None)
         if self.modal=='arena_match':
@@ -1870,15 +1884,13 @@ class Game:
             if items:self.read_notice(items[self.notice_list_scroll]['id'])
         elif action=='open_release_page':webbrowser.open(val or RELEASES_URL)
         elif action=='host_room':self.reload_story();self.start_room()
-        elif action=='join_dialog':
-            if self.slot_kind!='online':
-                self.modal='save_slots';self.say('オンラインセーブ枠を選んでください。',9);return
-            self.modal='join'
-            self.join_cursor={k:len(v) for k,v in self.join_fields.items()}
-            pygame.key.start_text_input();pygame.key.set_repeat(350,36)
+        elif action=='online_host_dialog':self.reload_story();self.open_online_dialog('host')
+        elif action=='join_dialog':self.open_online_dialog('join')
+        elif action=='online_mode':self.set_online_mode(val)
+        elif action=='online_cancel':self.cancel_internet_connection()
+        elif action=='copy_room_invite':self.copy_room_invite()
         elif action=='join_field':self.join_field=val
         elif action=='join_room':
-            pygame.key.stop_text_input();pygame.key.set_repeat()
             self.join_room()
         elif action=='story_editor':self.say('管理者用ツールはゲームから分離されました。')
         elif action=='chat':self.toggle_chat()
@@ -1988,6 +2000,18 @@ class Game:
         lo,hi=sorted((cursor,anchor if anchor is not None else cursor))
         ctrl=bool(pygame.key.get_mods() & pygame.KMOD_CTRL)
         shift=bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+        if event.type==pygame.KEYDOWN and ctrl:
+            if event.key in (pygame.K_c,pygame.K_x) and lo!=hi:
+                try:pygame.scrap.put_text(value[lo:hi])
+                except pygame.error:return value,cursor,anchor
+                if event.key==pygame.K_x:return value[:lo]+value[hi:],lo,None
+                return value,cursor,anchor
+            if event.key==pygame.K_v:
+                try:incoming=pygame.scrap.get_text() or ''
+                except pygame.error:return value,cursor,anchor
+                incoming=''.join(c for c in incoming if c.isprintable() and c not in '\r\n')
+                incoming=incoming[:max(0,limit-(len(value)-(hi-lo)))]
+                return value[:lo]+incoming+value[hi:],lo+len(incoming),None
         if event.type==pygame.TEXTINPUT:
             incoming=''.join(ch for ch in event.text if ch.isprintable() and ch not in '\r\n')
             result=(value[:lo]+incoming+value[hi:])[:limit]
@@ -2066,9 +2090,13 @@ class Game:
             elif event.type==pygame.TEXTINPUT and self.modal=='join':
                 k=self.join_field
                 value=self.join_fields[k]
-                value,cursor,anchor=self.edit_text_event(event,value,self.join_cursor[k],self.join_anchor[k],64)
+                value,cursor,anchor=self.edit_text_event(event,value,self.join_cursor[k],self.join_anchor[k],18 if k=='name' else 512)
                 self.join_fields[k]=value;self.join_cursor[k]=cursor;self.join_anchor[k]=anchor
             elif event.type==pygame.KEYDOWN:
+                if self.modal=='online_connect':
+                    if event.key==pygame.K_ESCAPE:self.cancel_internet_connection()
+                    elif event.key==pygame.K_F11:self.do_action('fullscreen',None)
+                    continue
                 if event.key in tuple(getattr(pygame,k,-500) for k in ('K_BACKQUOTE','K_MODE','K_KANJI')):
                     self.ime_composing=False
                     self.held_keys.clear()
@@ -2113,12 +2141,12 @@ class Game:
                     continue
                 if self.modal=='join' and event.key not in (pygame.K_ESCAPE,pygame.K_F11):
                     if event.key==pygame.K_TAB:
-                        order=['address','pin','name']
+                        order=self.join_edit_keys()
                         self.join_field=order[(order.index(self.join_field)+1)%len(order)]
                     elif event.key in (pygame.K_RETURN,pygame.K_KP_ENTER):self.join_room()
                     else:
                         k=self.join_field
-                        v,cur,anchor=self.edit_text_event(event,self.join_fields[k],self.join_cursor[k],self.join_anchor[k],64)
+                        v,cur,anchor=self.edit_text_event(event,self.join_fields[k],self.join_cursor[k],self.join_anchor[k],18 if k=='name' else 512)
                         self.join_fields[k]=v;self.join_cursor[k]=cur;self.join_anchor[k]=anchor
                     continue
                 if self.modal in ('notices','notice_zoom') and event.key in (
@@ -2196,6 +2224,7 @@ class Game:
                 self.mouse=self.point(event.pos)
                 if self.modal=='join':
                     for i,key in enumerate(('address','pin','name')):
+                        if key not in self.join_edit_keys():continue
                         if pygame.Rect(264,238+i*112,748,57).collidepoint(self.mouse):
                             self.join_field=key;break
                 if self.editor_click(self.mouse):
@@ -2444,7 +2473,9 @@ class Game:
         day,h,m=clock_at(self.state)
         text(s,self.fonts,'アンベラ牧場',(23,12),27,CREAM,True)
         text(s,self.fonts,'地域：'+(district_at(*self.player) if self.area==OUTDOOR else SCENE_MAPS[self.area].name),((607 if self.online_client else 25),49),13,GOLD_LIGHT,True,max_width=270)
-        if self.online_client:text(s,self.fonts,f'ONLINE {len(self.remote_players)+1}/{8}  PIN {self.room_pin}',(22,53),13,GOLD_LIGHT,True)
+        if self.online_client:
+            code=('部屋 '+self.online_room_code if self.online_room_code else 'PIN '+self.room_pin)
+            text(s,self.fonts,f'ONLINE {len(self.remote_players)+1}/{8}  {code}',(22,53),13,GOLD_LIGHT,True)
         if self.show_performance:
             ping = self.online_client.latency_ms if self.online_client else None
             metric = f'FPS {self.display_fps:.0f}' + (f'  PING {ping:.0f}ms' if ping is not None else '')
@@ -2736,7 +2767,7 @@ class Game:
         self.ui_button((421,263,438,56),'続きから遊ぶ','begin',size=26)
         self.ui_button((874,263,177,56),'セーブ枠','save_slots',size=18)
         self.ui_button((421,326,438,55),'新しい牧場を始める','newgame',size=24)
-        self.ui_button((421,391,210,50),'協力部屋を作る','host_room',size=18)
+        self.ui_button((421,391,210,50),'協力部屋を作る','online_host_dialog',size=18)
         self.ui_button((649,391,210,50),'オンライン参加','join_dialog',size=18)
         self.ui_button((421,452,210,49),'設定','settings',size=22)
         self.ui_button((649,452,210,49),'遊び方','overlay','help',size=22)
@@ -3692,8 +3723,12 @@ class Game:
         text(self.stage,self.fonts,'F5 セーブ  /  F6 書き出し  /  F7 読み込み',
              (640,564),18,GREEN_DARK,False,True)
         if self.online_client:
-            text(self.stage,self.fonts,f'オンライン {self.lan_address()}:{PORT} / PIN {self.room_pin}',
+            label=('部屋コード '+self.online_room_code if self.online_room_code else
+                   f'LAN {self.lan_address()}:{PORT} / PIN {self.room_pin}')
+            text(self.stage,self.fonts,label,
                  (640,591),15,GREEN_DARK,True,True)
+            if self.online_room_code:
+                self.ui_button((896,615,159,44),'招待をコピー','copy_room_invite',size=16)
         self.ui_button((492,615,296,44),'今すぐセーブ','save',size=18)
 
     def draw_help(self):
@@ -3827,20 +3862,38 @@ class Game:
              (640,646),15,GREEN_DARK,False,True)
 
     def draw_join(self):
-        self.overlay_panel('オンラインに参加','ホストのIPアドレス、ポート、6桁のPINを入力してください。LANの接続を推奨します。')
-        info=[('address','ホストのIP:PORT 例 192.168.1.10:47821'),('pin','部屋のPIN'),('name','プレイヤー名')]
+        hosting=self.online_intent=='host'
+        internet=self.join_mode=='internet'
+        self.overlay_panel('協力部屋を作る' if hosting else '友達の部屋に参加',
+                           '部屋主が遊んでいる間、最大8人で協力できます。お金・所持品はプレイヤーごとに保存。')
+        self.ui_button((264,154,360,37),('● ' if internet else '')+'インターネット / 部屋コード','online_mode','internet',size=16)
+        self.ui_button((652,154,360,37),('● ' if not internet else '')+'同じLAN / IP指定','online_mode','lan',size=16)
+        info=[('address','中継サーバーURL（初回だけ入力）' if internet else 'ホストのIP:PORT 例 192.168.1.10:47821'),
+              ('pin','部屋コード（作成後に自動発行）' if hosting else ('部屋コード / コピーした招待' if internet else '部屋のPIN')),
+              ('name','プレイヤー名')]
         for i,(key,caption) in enumerate(info):
             y=207+i*112
             text(self.stage,self.fonts,caption,(264,y),20,BROWN,True)
-            active=key==self.join_field
+            editable=key in self.join_edit_keys()
+            active=key==self.join_field and editable
             box(self.stage,(264,y+31,748,57),WHITE,GOLD if active else BROWN,6,3)
-            value=self.join_fields[key]
+            value=self.join_fields[key] if editable else '作成後、Escメニューで確認できます'
             if active:self.draw_editor_line(value,self.join_cursor[key],self.join_anchor[key],282,y+45,710,22)
             else:text(self.stage,self.fonts,value,(282,y+45),22,INK,max_width=710)
-            self.register('join_field',(264,y+31,748,57),key)
-        self.ui_button((460,570,360,58),'部屋に参加する','join_room',size=23)
-        text(self.stage,self.fonts,'Tabで入力欄を切替・Enterで接続  |  通信はLAN向けの試験版です。',
+            if editable:self.register('join_field',(264,y+31,748,57),key)
+        if self.message and time.monotonic()<self.message_until:
+            text(self.stage,self.fonts,self.message,(640,539),15,RED,True,True,max_width=820)
+        self.ui_button((460,570,360,58),'部屋を作成する' if hosting else '部屋に参加する','join_room',size=23)
+        text(self.stage,self.fonts,'Ctrl+Vで招待を貼り付け / Tabで欄を切替 / Enterで接続 / Escで戻る',
              (640,650),15,GREEN_DARK,False,True)
+
+    def draw_online_connect(self):
+        self.overlay_panel('友達との接続を準備しています','部屋に接続しています。Escでキャンセルできます。')
+        dots='.'*(int(time.monotonic()*3)%4)
+        text(self.stage,self.fonts,'中継サーバーに接続中'+dots,(640,298),28,BROWN,True,True)
+        status=self.online_job.progress if self.online_job else '接続を準備しています'
+        text(self.stage,self.fonts,status,(640,366),20,GREEN_DARK,False,True,max_width=820)
+        self.ui_button((460,478,360,58),'キャンセル','online_cancel',size=23)
 
     def apply_brightness(self):
         value=self.settings['brightness']
@@ -3863,6 +3916,7 @@ class Game:
         if self.modal:
             self.buttons.clear()
             if self.modal=='join':self.draw_join()
+            elif self.modal=='online_connect':self.draw_online_connect()
             elif self.modal=='interior':self.draw_interior()
             elif self.modal=='neighbor_town':self.draw_neighbor_town()
             elif self.modal=='neighbor_shop':self.draw_neighbor_shop()
@@ -3920,6 +3974,7 @@ class Game:
         pygame.display.flip()
 
     def update_gameplay(self,dt,now=None):
+        self.poll_internet_connection()
         now=time.monotonic() if now is None else now
         if self.scene=='world' and self.modal=='fishing':self.update_fishing(dt)
         if self.scene=='world' and self.modal is None:
@@ -3943,6 +3998,7 @@ class Game:
             if self.update_status and (not self.message or time.monotonic()>self.message_until):
                 self.say(self.update_status,9);self.update_status=''
             self.render()
+        if self.online_job:self.online_job.cancel();self.online_job=None
         if self.online_client:self.stop_online()
         elif self.scene=='world':self.persist(True)
         pygame.quit()
@@ -3951,6 +4007,9 @@ class Game:
 def main():
     try:
         if '--smoke-test' in sys.argv:
+            import websocket
+            if not callable(websocket.create_connection):
+                raise RuntimeError('Bundled online transport is missing')
             # Windows CI can verify packaged fonts, images, assets and title rendering
             # without opening an interactive game window or touching save files.
             os.environ['SDL_VIDEODRIVER'] = 'dummy'

@@ -16,6 +16,9 @@ def build(destination=None):
         raise RuntimeError('Windows EXE files must be built on Windows (or GitHub Actions windows-latest).')
     recovered = require_pixel_assets(BASE)
     print(f'Pixel asset layout ready: 12/12 images; recovered {len(recovered)} files.', flush=True)
+    # Root-level preflight also works when GitHub browser uploads flatten folders.
+    subprocess.run([sys.executable, '-m', 'unittest', '-q', 'verify_online_rooms'],
+                   cwd=BASE, check=True)
     destination = Path(destination or BASE / 'build_output').resolve()
     destination.mkdir(parents=True, exist_ok=True)
     work = destination / 'pyinstaller_work'
@@ -44,7 +47,7 @@ def build(destination=None):
     game = invoke('AmberaGame', 'ambera_farm.py', [crops, ('assets/buildings', 'assets/buildings'),
                                      ('assets/avatars', 'assets/avatars'), ('assets/items', 'assets/items'),
                                      ('assets/scenes', 'assets/scenes'), ('assets/scenery', 'assets/scenery'),
-                                     story, announcements, mail])
+                                     ('online_config.json', '.'), story, announcements, mail])
     editor = invoke('AmberaStoryEditor', 'story_editor.py', [story, announcements])
     launcher = invoke('AmberaFarm', 'exe_launcher.py')
     for result in (game, editor, launcher):

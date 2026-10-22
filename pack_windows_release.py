@@ -54,7 +54,7 @@ def pack(exe_folder: Path, output: Path, repo: str, version: str):
             '4. Admin editor is separate; it is not distributed to players.\r\n'
             '5. Save data: %%APPDATA%%\\AmberaFarm\\save.json.\r\n'
             '6. Game works offline. Failed updates do not block offline play.\r\n'
-            'Online co-op remains direct IP/LAN (no public matchmaking).\r\n'
+            'Online co-op: private room codes through a configured WSS relay; LAN also supported.\r\n'
             f'Build: v{version}\r\n').encode('ascii'))
     return install, payload, output / 'update_manifest.json'
 

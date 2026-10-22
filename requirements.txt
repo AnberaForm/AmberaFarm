@@ -1,1 +1,2 @@
-﻿pygame-ce==2.5.8
+pygame-ce==2.5.8
+websocket-client==1.9.2

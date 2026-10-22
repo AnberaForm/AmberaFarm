@@ -83,7 +83,8 @@ class _GameServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 class RoomServer:
-    def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None, fresh=False):
+    def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None, fresh=False,
+                 bind='0.0.0.0'):
         self.pin = str(pin if pin is not None else secrets.randbelow(900000) + 100000)
         self.host_token = secrets.token_hex(24)
         self.state = validate_state(copy.deepcopy(state))
@@ -320,7 +321,7 @@ class RoomServer:
                     except OSError:
                         pass
 
-        self.server = _GameServer(('0.0.0.0', int(port)), Handler)
+        self.server = _GameServer((bind, int(port)), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.08}, daemon=True)
         self.thread.start()
@@ -979,29 +980,35 @@ class RoomServer:
 
 
 class RoomClient:
-    def __init__(self, address, pin, name='Player', timeout=5, profile=None, host_token=None):
+    def __init__(self, address, pin, name='Player', timeout=5, profile=None, host_token=None,
+                 connection=None):
         if ':' in address and address.count(':') == 1:
             host, port = address.rsplit(':', 1)
             port = int(port)
         else:
             host, port = address, PORT
-        self.sock = socket.create_connection((host, port), timeout)
-        self.sock.settimeout(timeout)
-        profile = validate_state(copy.deepcopy(profile)) if profile is not None else new_state()
-        hello = {'type': 'hello', 'protocol': PROTOCOL, 'pin': str(pin).strip(),
-                 'name': safe_name(name), 'profile': profile}
-        if host_token:
-            hello['host_token'] = host_token
-        self.sock.sendall(pack(hello))
-        self.reader = self.sock.makefile('rb')
-        raw = self.reader.readline(MAX_PACKET + 1)
-        if not raw or len(raw) > MAX_PACKET:
+        self.sock = connection if connection is not None else socket.create_connection((host, port), timeout)
+        self.reader = None
+        try:
+            self.sock.settimeout(timeout)
+            profile = validate_state(copy.deepcopy(profile)) if profile is not None else new_state()
+            hello = {'type': 'hello', 'protocol': PROTOCOL, 'pin': str(pin).strip(),
+                     'name': safe_name(name), 'profile': profile}
+            if host_token:
+                hello['host_token'] = host_token
+            self.sock.sendall(pack(hello))
+            self.reader = self.sock.makefile('rb')
+            raw = self.reader.readline(MAX_PACKET + 1)
+            if not raw or len(raw) > MAX_PACKET:
+                raise ConnectionError('No response from host')
+            welcome = json.loads(raw.decode('utf-8'))
+            if not isinstance(welcome, dict) or welcome.get('type') != 'welcome':
+                raise ConnectionError(welcome.get('message', 'Connection denied') if isinstance(welcome, dict)
+                                      else 'Invalid host response')
+        except BaseException:
             self.sock.close()
-            raise ConnectionError('No response from host')
-        welcome = json.loads(raw.decode('utf-8'))
-        if welcome.get('type') != 'welcome':
-            self.sock.close()
-            raise ConnectionError(welcome.get('message', 'Connection denied'))
+            if self.reader is not None:self.reader.close()
+            raise
         self.id = welcome['id']
         self.spawn = welcome.get('spawn', list(SPAWN))
         self.inbox = queue.Queue(maxsize=64)
@@ -1043,6 +1050,9 @@ class RoomClient:
             pass
         finally:
             self.active = False
+            try:self.reader.close()
+            except OSError:pass
+            self.sock.close()
             if not self.inbox.full():
                 self.inbox.put_nowait({'type': 'disconnected'})
 
