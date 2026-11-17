@@ -81,7 +81,11 @@ jobs:
           name: AmberaFarm-Windows-TestBuild
           path: |
             build_output/release/AmberaFarm_Windows_v*.zip
-            build_output/release/AmberaFarm_Setup_v*.exe
+            build_output/release/AmberaFarm_Setup_v*.zip
+
+      - name: Verify account service is ready before publishing
+        if: github.ref_type == 'tag'
+        run: python deployment/check_account_service.py
 
       - name: Publish EXE distribution and update manifest
         if: github.ref_type == 'tag'
@@ -90,6 +94,7 @@ jobs:
           generate_release_notes: true
           files: |
             build_output/release/AmberaFarm_Setup_v*.exe
+            build_output/release/AmberaFarm_Setup_v*.zip
             build_output/release/AmberaFarm_Windows_v*.zip
             build_output/release/AmberaFarm_payload_v*.zip
             build_output/release/update_manifest.json
