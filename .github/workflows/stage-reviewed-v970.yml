@@ -1,0 +1,39 @@
+name: Stage reviewed AmberaFarm v9.7 source
+
+on:
+  push:
+    branches: [feature/account-saves-v970]
+    paths: [.github/workflows/stage-reviewed-v970.yml]
+
+permissions: {}
+
+jobs:
+  stage-source:
+    if: github.repository == 'AnberaForm/AmberaFarm' && github.ref == 'refs/heads/feature/account-saves-v970'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Apply exact reviewed source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=4df45cc1ad38a69f3993d150707d6e3132de8bd5
+          git merge-base --is-ancestor "$base" HEAD
+          test "$(git diff --name-only "$base" HEAD | tr '\n' ' ')" = ".github/workflows/stage-reviewed-v970.yml deployment/reviewed-v970.patch.b64 "
+          test -z "$(git status --porcelain)"
+          diff_file="$(mktemp)"
+          trap 'rm -f "$diff_file"' EXIT
+          base64 --decode deployment/reviewed-v970.patch.b64 | gzip --decompress > "$diff_file"
+          printf '%s  %s\n' 'f804deaa146c64754bf15cf3f61345baab75e96f89e08fd41efd313c12c87609' "$diff_file" | sha256sum --check
+          git apply --check --index "$diff_file"
+          git apply --index "$diff_file"
+          git diff --cached --check
+          test "$(git diff --cached --name-only | wc -l)" -eq 30
+          git rm -- deployment/reviewed-v970.patch.b64
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Add account login and separate normal and online saves"
+          git push origin HEAD:refs/heads/feature/account-saves-v970
