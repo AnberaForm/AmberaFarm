@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import zipfile
 from exe_launcher import read_version, apply_update
 
 BASE=Path(__file__).resolve().parent
@@ -29,6 +30,10 @@ def verify(release_folder=None):
     logs=release.parent/'setup_logs'
     logs.mkdir(parents=True,exist_ok=True)
     checks=[]
+    with zipfile.ZipFile(setup.with_suffix('.zip')) as archive:
+        assert archive.namelist() == [setup.name]
+        assert hashlib.sha256(archive.read(setup.name)).digest() == hashlib.sha256(setup.read_bytes()).digest()
+    checks.append('Download ZIP contains exactly the matching Setup executable')
     with tempfile.TemporaryDirectory(prefix='ambera_setup_test_') as temporary:
         work=Path(temporary)
         install=work/'installed'

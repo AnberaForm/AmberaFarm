@@ -156,9 +156,9 @@ def test_old_area_packets_and_bad_positions_do_not_rewind_a_warp(game):
     assert game.area=='room:home' and can_stand(game.area,*game.interior_pos)
 
 
-def test_switching_save_slots_clears_the_previous_map(game):
+def test_loading_a_normal_farm_clears_the_previous_map(game):
     game.enter_area('room:home')
-    game.select_slot('offline',2)
+    game.set_normal_state(new_state())
     assert game.area==OUTDOOR and game.interior is None and game.scene=='title'
 
 

@@ -2,10 +2,8 @@
 """Background co-op connection jobs and Pygame UI state."""
 from __future__ import annotations
 
-import copy
 import json
-import os
-from pathlib import Path
+import secrets
 import socket
 import ssl
 import threading
@@ -14,22 +12,23 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
-from multiplayer import RoomClient, RoomServer, PROTOCOL
+from multiplayer import RoomClient
+from account_protocol import ACCOUNT_PROTOCOL, AccountError
 from online_rooms import (RelayHost, RelayError, connect_guest, invitation, parse_invitation,
-                          relay_url, search_rooms, request_admission)
-from room_saves import room_file, local_room_identity
+                          relay_url, search_rooms, request_admission, format_code)
 from farm_core import new_state
+from v8_features import init_v8
 
 
-def wait_for_relay(endpoint, cancelled, progress, max_wait=75):
+def wait_for_relay(endpoint, cancelled, progress, max_wait=75, require_accounts=False):
     """Allow a sleeping managed service to wake without blocking the renderer."""
     u = urlsplit(relay_url(endpoint))
     health = urlunsplit(('https' if u.scheme == 'wss' else 'http', u.netloc, '/health', '', ''))
     until = time.monotonic() + max_wait
     while not cancelled.is_set():
-        progress('中継サーバーの起動を確認しています（最大75秒）')
+        progress('サーバーの起動を待っています（最大75秒）')
         try:
-            request = urllib.request.Request(health, headers={'User-Agent': 'AmberaFarm/9.5'})
+            request = urllib.request.Request(health, headers={'User-Agent': 'AmberaFarm/9.7'})
             with urllib.request.urlopen(request, timeout=5) as response:
                 actual = urlsplit(response.geturl())
                 if actual.scheme != urlsplit(health).scheme or actual.netloc != u.netloc:
@@ -38,6 +37,8 @@ def wait_for_relay(endpoint, cancelled, progress, max_wait=75):
                 if (not isinstance(data, dict) or data.get('service') != 'AmberaFarm Relay'
                         or data.get('status') != 'ok'):
                     raise ValueError('Unexpected health response')
+                if require_accounts and data.get('accounts') is not True:
+                    raise AccountError('account_unavailable')
                 return
         except urllib.error.HTTPError as exc:
             if exc.code not in (408, 429, 502, 503, 504):
@@ -55,23 +56,8 @@ def wait_for_relay(endpoint, cancelled, progress, max_wait=75):
     raise ConnectionError('接続をキャンセルしました。')
 
 
-def configured_relay(settings, roots):
-    configured = settings.get('online_relay_url') or os.environ.get('AMBERA_RELAY_URL', '')
-    if configured:
-        return configured
-    for root in roots:
-        try:
-            data = json.loads((Path(root) / 'online_config.json').read_text(encoding='utf-8-sig'))
-            if isinstance(data, dict) and isinstance(data.get('relay_url'), str):
-                if data['relay_url'].strip():
-                    return data['relay_url'].strip()
-        except (OSError, ValueError):
-            pass
-    return ''
-
-
 def close_bundle(bundle):
-    for key in ('relay', 'client', 'server'):
+    for key in ('relay', 'client'):
         resource = bundle.get(key)
         if resource is not None:
             try:
@@ -81,17 +67,16 @@ def close_bundle(bundle):
 
 
 class ConnectionJob:
-    """Only the main thread adopts resources; cancellation closes late results."""
-    def __init__(self, kind, fields, state, save_file, story_nodes):
+    """Network operations run off the game loop; no local saves enter this job."""
+    def __init__(self, kind, fields, endpoint, session):
         self.kind = kind
         self.fields = dict(fields)
-        self.state = copy.deepcopy(state)
-        self.save_file = Path(save_file)
-        self.story_nodes = copy.deepcopy(story_nodes)
+        self.endpoint = relay_url(endpoint)
+        self.session = session
         self.lock = threading.Lock()
         self.cancelled = False
         self.cancel_event = threading.Event()
-        self.progress = '中継サーバーに接続しています'
+        self.progress = '部屋に接続しています'
         self.result = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -101,52 +86,47 @@ class ConnectionJob:
         bundle = {}
         error = None
         try:
-            name = self.fields['name']
-            if self.kind in ('host', 'request'):
-                endpoint = relay_url(self.fields['address'])
-            else:
-                endpoint, code, pin = parse_invitation(self.fields['pin'], self.fields['address'])
-            wait_for_relay(endpoint, self.cancel_event, lambda value: setattr(self, 'progress', value))
-            self.progress = '部屋主と参加者をつないでいます'
+            name = self.session.account.name
+            token = self.session.token
+            if self.kind == 'join':
+                target, code, pin = parse_invitation(self.fields['pin'], self.endpoint)
+                if target != self.endpoint:
+                    raise ConnectionError('この招待はアンベラ牧場のアカウント用サーバーに対応していません。')
+            wait_for_relay(self.endpoint, self.cancel_event, self._progress, require_accounts=True)
+            self._progress('オンライン専用の牧場に接続しています')
+            approval = None
             if self.kind == 'host':
-                server = RoomServer(new_state(), self.fields.get('world_file', room_file(1)),
-                                    port=0, bind='127.0.0.1', story_nodes=self.story_nodes,
-                                    room_owned=True)
-                bundle['server'] = server
-                bundle['client'] = RoomClient(f'127.0.0.1:{server.port}', server.pin, name,
-                                               host_token=server.host_token, room_owned=True,
-                                               identity=local_room_identity())
-                bundle['relay'] = RelayHost(endpoint, server.port, server.pin, PROTOCOL,
-                                           title=self.fields.get('title', ''), name=name,
-                                           public=self.fields.get('public', False))
-                bundle['code'] = bundle['relay'].share_code
-                bundle['pin'] = server.pin
-            else:
-                approval = None
-                if self.kind == 'request':
-                    code = self.fields['room_id']
-                    admitted = request_admission(endpoint, code, name, PROTOCOL, self.cancel_event,
-                                                 lambda v: setattr(self, 'progress', v))
-                    pin, approval = admitted['pin'], admitted['approval']
-                try:
-                    transport = connect_guest(endpoint, code, pin, PROTOCOL, approval=approval)
-                except RelayError as exc:
-                    if exc.code != 'approval_required':
-                        raise
-                    admitted = request_admission(endpoint, code, name, PROTOCOL, self.cancel_event,
-                                                 lambda v: setattr(self, 'progress', v))
-                    pin = admitted['pin']
-                    transport = connect_guest(endpoint, code, pin, PROTOCOL, approval=admitted['approval'])
-                try:
-                    bundle['client'] = RoomClient('relay', pin, name, room_owned=True,
-                                                  identity=local_room_identity(), connection=transport)
-                except BaseException:
-                    transport.close()
+                pin = str(secrets.randbelow(900000) + 100000)
+                host = RelayHost(self.endpoint, None, pin, ACCOUNT_PROTOCOL, name=name,
+                                 title=self.fields.get('title', ''),
+                                 public=self.fields.get('public', False), session=token)
+                bundle['relay'] = host
+                code = host.code
+            elif self.kind == 'request':
+                code = self.fields['room_id']
+                reply = request_admission(self.endpoint, code, name, ACCOUNT_PROTOCOL,
+                                          self.cancel_event, self._progress, session=token)
+                pin, approval = reply['pin'], reply['approval']
+            if self.cancel_event.is_set():
+                raise ConnectionError('接続をキャンセルしました。')
+            try:
+                transport = connect_guest(self.endpoint, code, pin, ACCOUNT_PROTOCOL,
+                                          approval=approval, session=token)
+            except RelayError as exc:
+                if exc.code != 'approval_required' or self.kind != 'join':
                     raise
-                from online_rooms import format_code
-                bundle['code'] = format_code(code, pin)
-                bundle['pin'] = pin
-            bundle['endpoint'] = endpoint
+                reply = request_admission(self.endpoint, code, name, ACCOUNT_PROTOCOL,
+                                          self.cancel_event, self._progress, session=token)
+                pin = reply['pin']
+                transport = connect_guest(self.endpoint, code, pin, ACCOUNT_PROTOCOL,
+                                          approval=reply['approval'], session=token)
+            try:
+                bundle['client'] = RoomClient('relay', pin, connection=transport,
+                                              relay_authenticated=True)
+            except BaseException:
+                transport.close()
+                raise
+            bundle.update(code=format_code(code, pin), pin=pin, endpoint=self.endpoint)
         except Exception as exc:
             close_bundle(bundle)
             bundle = {}
@@ -159,6 +139,9 @@ class ConnectionJob:
                 dispose = {}
             self.ready.set()
         close_bundle(dispose)
+
+    def _progress(self, message):
+        self.progress = message
 
     def take(self):
         with self.lock:
@@ -175,8 +158,8 @@ class ConnectionJob:
 
 
 class DirectoryJob:
-    def __init__(self, endpoint, query):
-        self.endpoint, self.query = endpoint, query
+    def __init__(self, endpoint, query, session):
+        self.endpoint, self.query, self.session = endpoint, query, session
         self.ready = threading.Event()
         self.cancel_event = threading.Event()
         self.progress = '部屋一覧を取得しています'
@@ -185,8 +168,9 @@ class DirectoryJob:
 
     def _run(self):
         try:
-            wait_for_relay(self.endpoint, self.cancel_event, lambda v: setattr(self, 'progress', v))
-            self.rows = search_rooms(self.endpoint, self.query, PROTOCOL)
+            wait_for_relay(self.endpoint, self.cancel_event, lambda v: setattr(self, 'progress', v),
+                           require_accounts=True)
+            self.rows = search_rooms(self.endpoint, self.query, ACCOUNT_PROTOCOL, self.session.token)
         except Exception as exc:
             self.error = str(exc)[:180] or '部屋一覧を取得できませんでした。'
         finally:
@@ -194,25 +178,21 @@ class DirectoryJob:
 
 
 class InternetRoomsMixin:
-    def init_internet_rooms(self, roots, settings_saver):
-        self.online_settings_saver = settings_saver
+    def init_internet_rooms(self):
         self.online_job = None
         self.online_relay = None
         self.online_room_code = ''
         self.online_endpoint = ''
-        self.online_room_owned = False
         self.online_intent = 'join'
-        self.join_mode = 'lan'
-        self.lan_fields = self.join_fields
-        self.internet_fields = {'address': configured_relay(self.settings, roots),
-                                'pin': '', 'name': self.state['player_name'],
-                                'title': self.state['player_name'] + 'の牧場'}
+        self.join_fields = {'title': '', 'pin': ''}
+        self.join_cursor = {'title': 0, 'pin': 0}
+        self.join_anchor = {'title': None, 'pin': None}
+        self.join_field = 'pin'
         self.host_public = True
-        self.host_world_slot = 1
-        self.browser_fields = {'name': self.state['player_name'], 'query': ''}
+        self.browser_fields = {'query': ''}
         self.browser_field = 'query'
-        self.browser_cursor = {k: len(v) for k, v in self.browser_fields.items()}
-        self.browser_anchor = {k: None for k in self.browser_fields}
+        self.browser_cursor = {'query': 0}
+        self.browser_anchor = {'query': None}
         self.directory_job = None
         self.directory_rows = []
         self.directory_status = '部屋名・部屋主名で検索できます。'
@@ -222,60 +202,36 @@ class InternetRoomsMixin:
         self.seen_admissions = set()
         self.seen_friend_requests = set()
 
-    def set_online_mode(self, mode):
-        self.join_mode = mode
-        self.join_fields = self.internet_fields if mode == 'internet' else self.lan_fields
-        self.join_cursor = {k: len(v) for k, v in self.join_fields.items()}
-        self.join_anchor = {k: None for k in self.join_fields}
-        self.join_field = 'address'
-
     def join_edit_keys(self):
-        if self.online_intent == 'host':
-            return ['address', 'title', 'name'] if self.join_mode == 'internet' else ['address', 'name']
-        return ['address', 'pin', 'name']
-
-    def join_row_keys(self):
-        return ['address', 'title' if self.online_intent == 'host' and self.join_mode == 'internet'
-                else 'pin', 'name']
+        return ['title' if self.online_intent == 'host' else 'pin']
 
     def open_room_browser(self):
         import pygame
-        if self.online_client or self.online_job:
-            self.say('参加中の部屋を終了してから、ほかの部屋を探してください。', 8)
+        if not self.account_session or self.online_job:
             return
-        self.browser_fields['name'] = self.state['player_name']
-        self.browser_cursor['name'] = len(self.browser_fields['name'])
+        if self.online_client:
+            self.say('部屋を終了してから、ほかの部屋を探してください。', 8)
+            return
         self.modal = 'room_browser'
         pygame.key.start_text_input()
         pygame.key.set_repeat(350, 36)
         self.refresh_room_directory()
 
     def refresh_room_directory(self):
-        if self.directory_job or time.monotonic() - self.directory_updated < 2:
-            return
-        try:
-            endpoint = relay_url(self.internet_fields['address'])
-        except ValueError as exc:
-            self.directory_status = str(exc)
+        if (not self.account_session or self.directory_job
+                or time.monotonic() - self.directory_updated < 2):
             return
         self.directory_updated = time.monotonic()
         self.directory_status = '部屋一覧を取得しています'
-        self.directory_job = DirectoryJob(endpoint, self.browser_fields['query'])
+        self.directory_job = DirectoryJob(self.account_endpoint, self.browser_fields['query'],
+                                          self.account_session)
 
     def request_room_entry(self, room_id):
-        import pygame
-        if self.online_client or self.online_job:
+        if not self.account_session or self.online_client or self.online_job:
             return
-        row = next((r for r in self.directory_rows if r['id'] == room_id), None)
-        if not row:
+        if not any(row['id'] == room_id for row in self.directory_rows):
             return
-        fields = {'address': self.internet_fields['address'], 'room_id': room_id,
-                  'name': self.browser_fields['name'].strip() or '牧場主', 'return_modal': 'room_browser'}
-        self.online_job = ConnectionJob('request', fields, self.state, self.save_file, self.story_nodes)
-        self.modal = 'online_connect'
-        pygame.key.stop_text_input()
-        pygame.key.set_repeat()
-        self.held_keys.clear()
+        self._connect_room('request', {'room_id': room_id, 'return_modal': 'room_browser'})
 
     def pending_requests(self):
         rows = []
@@ -286,32 +242,26 @@ class InternetRoomsMixin:
 
     def open_online_dialog(self, kind):
         import pygame
-        if self.online_client or self.online_job:
+        if not self.account_session or self.online_client or self.online_job:
             return
         self.online_intent = kind
-        self.internet_fields['name'] = self.state['player_name']
-        self.lan_fields['name'] = self.state['player_name']
-        self.set_online_mode('internet')
+        self.join_field = self.join_edit_keys()[0]
+        if kind == 'host' and not self.join_fields['title']:
+            self.join_fields['title'] = self.account_session.account.name + 'の牧場'
+        self.join_cursor[self.join_field] = len(self.join_fields[self.join_field])
+        self.join_anchor[self.join_field] = None
         self.modal = 'join'
         pygame.key.start_text_input()
         pygame.key.set_repeat(350, 36)
 
     def begin_internet_connection(self):
+        if not self.account_session or self.online_client or self.online_job:
+            return
+        self._connect_room(self.online_intent, dict(self.join_fields, public=self.host_public))
+
+    def _connect_room(self, kind, fields):
         import pygame
-        if self.online_client or self.online_job:
-            return
-        try:
-            if self.online_intent == 'host':
-                endpoint = relay_url(self.join_fields['address'])
-            else:
-                endpoint, _, _ = parse_invitation(self.join_fields['pin'], self.join_fields['address'])
-        except ValueError as exc:
-            self.say(str(exc), 12)
-            return
-        self.join_fields['address'] = endpoint
-        fields = dict(self.join_fields, public=self.host_public, world_file=room_file(self.host_world_slot))
-        self.online_job = ConnectionJob(self.online_intent, fields, self.state,
-                                         self.save_file, self.story_nodes)
+        self.online_job = ConnectionJob(kind, fields, self.account_endpoint, self.account_session)
         self.modal = 'online_connect'
         pygame.key.stop_text_input()
         pygame.key.set_repeat()
@@ -354,21 +304,19 @@ class InternetRoomsMixin:
                 pygame.key.set_repeat(350, 36)
                 self.say('接続できません: ' + error, 15)
                 return
-            if job.kind == 'host':
-                self.host_offline_state = copy.deepcopy(self.state)
-                self.online_server = bundle['server']
-                self.online_relay = bundle['relay']
-            else:
-                self.offline_state = copy.deepcopy(self.state)
+            self.offline_state = self.state
+            self.offline_layout = self.inventory_layout
+            self.state = init_v8(new_state())
+            self.state['player_name'] = self.account_session.account.name
+            self.selected = self.state['selected_crop']
+            self.inventory_layout = []
             self.online_client = bundle['client']
+            self.online_relay = bundle.get('relay')
             self.online_guest = job.kind != 'host'
-            self.online_room_owned = self.online_client.room_owned
             self.online_room_code = bundle['code']
             self.room_pin = bundle['pin']
             self.online_endpoint = bundle['endpoint']
-            self.settings['online_relay_url'] = self.online_endpoint
-            # No PIN, invite, or host credential is written to settings.
-            self.online_settings_saver(self.settings)
+            self.has_online_farm = True
             self.reset_map_state()
             self.player = list(self.online_client.spawn)
             self.movement_trail.clear()
@@ -376,7 +324,7 @@ class InternetRoomsMixin:
             self.modal = None
             pygame.key.stop_text_input()
             pygame.key.set_repeat()
-            self.say('部屋専用データで参加しました。Escの「申請欄」で届いた申請を確認できます。', 15)
+            self.say('オンライン専用データで参加しました。参加申請は Esc →「申請欄」で確認できます。', 12)
         if self.online_relay:
             pending = {r['id'] for r in self.online_relay.pending_requests()}
             if pending - self.seen_admissions:
@@ -388,7 +336,10 @@ class InternetRoomsMixin:
         self.seen_friend_requests = friends
         if self.online_relay and not self.online_relay.active:
             self.stop_online()
-            self.say('中継接続が切れたため部屋を終了しました。進行は部屋主の牧場に保存します。', 15)
+            self.reload_story()
+            self.scene = 'title'
+            self.modal = None
+            self.say('サーバーとの接続が切れたため部屋を終了しました。', 12)
 
     def copy_room_invite(self):
         import pygame

@@ -124,9 +124,9 @@ def main() -> int:
             status = run_command([python, '-m', 'pip', 'install', '--disable-pip-version-check',
                                   '--only-binary=:all:', '--no-input', '--timeout', '5', '--retries', '0', ONLINE_PKG],
                                  '[SETUP] Installing online room support')
-            if status:report('[WARN] Online rooms unavailable; offline and LAN play are still available.')
+            if status:report('[WARN] Could not install the connection library required for game login.')
     except (OSError, subprocess.SubprocessError):
-        report('[WARN] Could not prepare online rooms; offline and LAN play are still available.')
+        report('[WARN] Could not prepare the connection library required for game login.')
 
     if not (ROOT / 'ambera_farm.py').is_file() or not (ROOT / 'farm_core.py').is_file():
         report('[ERROR] Missing game files. Extract all ZIP files to a normal folder.')

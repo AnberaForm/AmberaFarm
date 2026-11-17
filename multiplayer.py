@@ -44,6 +44,7 @@ from area_world import (OUTDOOR, NEIGHBOR, AREAS, can_enter, at_facility,
 from profile_progress import (init_profile, public_profile, refresh_progress,
                               claim_daily, apply_arena_result, clean_bio, unlocked_titles)
 from room_saves import load_room, save_room, member_key, MAX_MEMBERS
+from account_protocol import ACCOUNT_PROTOCOL
 
 PORT = 47821
 MAX_PLAYERS = 8
@@ -86,21 +87,26 @@ class _GameServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 class RoomServer:
     def __init__(self, state, save_file, port=PORT, pin=None, story_nodes=None, fresh=False,
-                 bind='0.0.0.0', room_owned=False):
+                 bind='0.0.0.0', room_owned=False, managed=None):
         self.pin = str(pin if pin is not None else secrets.randbelow(900000) + 100000)
         self.host_token = secrets.token_hex(24)
-        self.room_owned = bool(room_owned)
+        self.managed = managed
+        self.protocol = ACCOUNT_PROTOCOL if managed else PROTOCOL
+        self.room_owned = bool(room_owned or managed)
         self.members = {}
-        if self.room_owned:
+        if managed:
+            self.state = copy.deepcopy(managed.profiles[managed.owner.id])
+        elif self.room_owned:
             self.state, self.members = load_room(save_file)
         else:
             self.state = validate_state(copy.deepcopy(state))
         if fresh:
             self.state['plots']=[None] * PLOT_COUNT
             init_v8(self.state)['plot_preparation']=[0]*PLOT_COUNT
-        self.host_profile = copy.deepcopy(self.state)
-        self.save_file = Path(save_file)
+        self.host_profile = managed.profiles[managed.owner.id] if managed else copy.deepcopy(self.state)
+        self.save_file = Path(save_file) if save_file is not None else None
         self.lock = threading.RLock()
+        self.closing = False
         self.players = {}
         self.sockets = {}
         self.host_id = None
@@ -123,21 +129,36 @@ class RoomServer:
                 sock.settimeout(7)
                 file = sock.makefile('rb')
                 pid = None
+                seat = None
                 try:
                     raw = file.readline(MAX_PACKET + 1)
                     if not raw or len(raw) > MAX_PACKET:
                         return
                     hello = json.loads(raw.decode('utf-8'))
                     if (not isinstance(hello, dict) or hello.get('type') != 'hello'
-                            or hello.get('protocol') != PROTOCOL or str(hello.get('pin')) != parent.pin):
+                            or hello.get('protocol') != parent.protocol or str(hello.get('pin')) != parent.pin):
                         sock.sendall(pack({'type': 'error', 'message': 'PIN / version mismatch'}))
                         return
                     is_host = secrets.compare_digest(str(hello.get('host_token', '')), parent.host_token)
                     with parent.lock:
+                        if parent.closing:
+                            return
                         if len(parent.players) >= MAX_PLAYERS:
                             sock.sendall(pack({'type': 'error', 'message': 'Room full'}))
                             return
-                        if is_host:
+                        if parent.managed:
+                            seat = parent.managed.enter(hello.get('room_ticket'))
+                            if seat is None:
+                                sock.sendall(pack({'type': 'error', 'message': 'ログインした部屋から接続してください。'}))
+                                return
+                            identity = seat.account.id
+                            if any(p.get('identity') == identity for p in parent.players.values()):
+                                sock.sendall(pack({'type': 'error', 'message': 'すでにオンラインでプレイ中です。'}))
+                                return
+                            is_host = identity == parent.managed.owner.id
+                            profile = parent.managed.profiles[identity]
+                            seat.accepted = True
+                        elif is_host:
                             if parent.host_id is not None:
                                 sock.sendall(pack({'type': 'error', 'message': 'Host already connected'}))
                                 return
@@ -171,24 +192,25 @@ class RoomServer:
                         x, y = profile['player']
                         if not can_stand(x, y):
                             x, y = SPAWN
+                        name = seat.account.name if seat else safe_name(hello.get('name'))
                         parent.players[pid] = {
-                            'id': pid, 'name': safe_name(hello.get('name')),
+                            'id': pid, 'name': name,
                             'x': x, 'y': y, 'last': time.monotonic(), 'move_seq': -1, 'move_step_seq': 0,
                             'profile': profile, 'identity': identity, 'last_chat': 0., 'last_rescue': 0.,
                             'uid':profile['player_uid'], 'emote':'', 'emote_seq':0, 'emote_until':0., 'last_emote':0., 'party_id':None,
                             'area':OUTDOOR, 'scene_x':ROOM_SPAWN[0], 'scene_y':ROOM_SPAWN[1],
                             'scene_seq':-1, 'scene_revision':0, 'scene_last':time.monotonic(),
-                            'facing':'down', 'fishing':None,
+                            'facing':'down', 'fishing':None, 'last_action': 0.,
                         }
                         if is_host:
                             parent.host_id = pid
-                        profile['player_name'] = safe_name(hello.get('name'))
+                        profile['player_name'] = name
                         parent.sockets[pid] = sock
                     sock.sendall(pack({'type': 'welcome', 'id': pid, 'pin': parent.pin,
                                        'spawn': [x, y], 'room_owned': parent.room_owned}))
                     # Keep TCP packets small and disable Nagle's delay on position inputs.
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    sock.settimeout(None)
+                    sock.settimeout(6 if parent.managed else None)
                     last_state = -STATE_INTERVAL
                     last_positions = -POSITION_INTERVAL
                     last_chat = -CHAT_INTERVAL
@@ -198,6 +220,7 @@ class RoomServer:
                     last_position_sent = 0.
                     last_ack_seq = -1
                     last_scene_ack = -1
+                    last_save_problem = ''
                     while True:
                         now = time.monotonic()
                         packets = []
@@ -207,6 +230,12 @@ class RoomServer:
                             player = parent.players.get(pid)
                             if player is None:
                                 break
+                            if parent.managed:
+                                parent.checkpoint_account()
+                                problem = parent.managed.problem
+                                if problem != last_save_problem:
+                                    packets.append({'type': 'save_status', 'problem': problem})
+                                    last_save_problem = problem
                             # Full state is sent initially, following farm edits and
                             # periodically as a recovery / stamina synchronization.
                             if (now - last_state >= STATE_INTERVAL
@@ -302,13 +331,26 @@ class RoomServer:
                             elif kind == 'fish_input':
                                 parent._fish_input(pid, incoming)
                             elif kind == 'action':
-                                result = parent._action(pid, incoming)
+                                player = parent.players[pid]
+                                action = incoming.get('action')
+                                if parent.managed and action == 'save_now':
+                                    player['profile']['player'] = [round(player['x'], 2), round(player['y'], 2)]
+                                    parent._save_host()
+                                    ok = parent.checkpoint_account(force=True)
+                                    result = 'オンラインの進行を保存しました。' if ok else '保存できません。接続を確認しています。'
+                                elif parent.managed and parent.managed.problem:
+                                    result = '保存の接続を確認中です。反映を待ってから操作してください。'
+                                elif parent.managed and now - player['last_action'] < .08:
+                                    continue
+                                else:
+                                    player['last_action'] = now
+                                    result = parent._action(pid, incoming)
                                 # Notify peers quickly (also for friend/duel changes).
                                 parent.world_revision += 1
                                 profile = parent.players[pid]['profile']
                                 response = {'type': 'result', 'message': result,
                                     'warp_to': list(TRAVEL_STOPS[incoming.get('value')][1])
-                                        if incoming.get('action')=='travel' and isinstance(result,str)
+                                        if action=='travel' and isinstance(result,str)
                                         and result.startswith('馬車で移動') else None,
                                     'state': merged_view(profile, parent.state['plots'], parent.state['plot_preparation']),
                                     'duel': parent.duel_view(pid),
@@ -342,13 +384,20 @@ class RoomServer:
                                 if inviter==pid:parent.party_invites.pop(target,None)
                             for invites in parent.friend_invites.values():
                                 if pid in invites:invites.remove(pid)
-                            if parent.room_owned:
+                            if parent.managed and seat and seat.accepted:
+                                player = parent.players.get(pid)
+                                if player:
+                                    player['profile']['player'] = [round(player['x'], 2), round(player['y'], 2)]
+                                parent.managed.depart(seat, parent.state['plots'], parent.state['plot_preparation'])
+                            elif parent.room_owned and not parent.managed:
                                 try:parent._save_host()
                                 except (OSError, SaveError):pass
                             parent.players.pop(pid, None)
                             parent.sockets.pop(pid, None)
                             if pid == parent.host_id:
                                 parent.host_id = None
+                    if seat and not seat.done.is_set():
+                        seat.done.set()
                     try:
                         file.close()
                     except OSError:
@@ -360,12 +409,19 @@ class RoomServer:
         self.thread.start()
 
     def _save_host(self):
+        if self.managed:
+            self.managed.dirty = True
+            return
         # Host profile is the local save. Guest balances never enter this file.
         self.state = merged_view(self.host_profile, self.state['plots'], self.state['plot_preparation'])
         if self.room_owned:
             save_room(self.save_file, self.state, self.members)
         else:
             save_state(self.state, self.save_file)
+
+    def checkpoint_account(self, force=False):
+        with self.lock:
+            return self.managed.checkpoint(self.state['plots'], self.state['plot_preparation'], force)
 
     def party_view(self,pid):
         player=self.players[pid]
@@ -759,6 +815,18 @@ class RoomServer:
         return 'この操作はまだできません'
 
     def _action(self, pid, msg):
+        if not self.managed:
+            return self._apply_action(pid, msg)
+        profile = self.players[pid]['profile']
+        home, soil = profile['plots'], profile['plot_preparation']
+        try:
+            return self._apply_action(pid, msg)
+        finally:
+            # Guests play on the current shared farm. Their own home plots
+            # stay in their account and must never be replaced by this room.
+            profile['plots'], profile['plot_preparation'] = home, soil
+
+    def _apply_action(self, pid, msg):
         action = msg.get('action')
         data = msg.get('value')
         p = self.players[pid]
@@ -1001,7 +1069,13 @@ class RoomServer:
 
     def close(self):
         with self.lock:
+            self.closing = True
             connections = list(self.sockets.values())
+            if self.managed:
+                for pid, player in self.players.items():
+                    self._duel_disconnect(pid)
+                    self._arena_disconnect(pid)
+                    player['profile']['player'] = [round(player['x'], 2), round(player['y'], 2)]
             self.sockets.clear()
             self.players.clear()
         for sock in connections:
@@ -1017,12 +1091,14 @@ class RoomServer:
         self.server.server_close()
         self.thread.join(timeout=2)
         with self.lock:
+            if self.managed:
+                return self.checkpoint_account(force=True)
             self._save_host()
 
 
 class RoomClient:
     def __init__(self, address, pin, name='Player', timeout=5, profile=None, host_token=None,
-                 connection=None, identity=None, room_owned=False):
+                 connection=None, identity=None, room_owned=False, relay_authenticated=False):
         if ':' in address and address.count(':') == 1:
             host, port = address.rsplit(':', 1)
             port = int(port)
@@ -1032,14 +1108,15 @@ class RoomClient:
         self.reader = None
         try:
             self.sock.settimeout(timeout)
-            profile = (new_state() if room_owned else
-                       validate_state(copy.deepcopy(profile)) if profile is not None else new_state())
-            hello = {'type': 'hello', 'protocol': PROTOCOL, 'pin': str(pin).strip(),
-                     'name': safe_name(name), 'profile': profile,
-                     'identity': identity or secrets.token_hex(32)}
-            if host_token:
-                hello['host_token'] = host_token
-            self.sock.sendall(pack(hello))
+            if not relay_authenticated:
+                profile = (new_state() if room_owned else
+                           validate_state(copy.deepcopy(profile)) if profile is not None else new_state())
+                hello = {'type': 'hello', 'protocol': PROTOCOL, 'pin': str(pin).strip(),
+                         'name': safe_name(name), 'profile': profile,
+                         'identity': identity or secrets.token_hex(32)}
+                if host_token:
+                    hello['host_token'] = host_token
+                self.sock.sendall(pack(hello))
             self.reader = self.sock.makefile('rb')
             raw = self.reader.readline(MAX_PACKET + 1)
             if not raw or len(raw) > MAX_PACKET:

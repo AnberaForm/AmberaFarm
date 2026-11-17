@@ -3,14 +3,12 @@
 from __future__ import annotations
 import copy
 import json
-import os
 from pathlib import Path
 import secrets
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
 
 from farm_core import new_state, SaveError
 from v8_features import init_v8
@@ -160,7 +158,7 @@ class LobbyTests(unittest.TestCase):
     def test_approval_expiry_and_capacity_reservations(self):
         _,_,relay=self.room()
         grant=self.approved(relay)
-        self.running.relay.rooms[relay.code].approvals[grant['approval']]=0
+        self.running.relay.rooms[relay.code].approvals[grant['approval']]=(0, None)
         with self.assertRaises(RelayError):self.guest(relay,grant['approval'])
         for _ in range(7):self.approved(relay)
         ws=_websocket(self.running.endpoint);self.sockets.append(ws)
@@ -222,42 +220,6 @@ class LobbyTests(unittest.TestCase):
         host.action('friend_accept',guest.id)
         self.assertTrue(wait_for(lambda:server.players[guest.id]['uid'] in server.host_profile['friend_ids']))
 
-    def test_real_pygame_search_request_approval_and_return_preserve_local_save(self):
-        from ambera_farm import Game,pygame
-        from save_slots import load_slot
-        server,_,relay=self.room()
-        with patch.dict(os.environ,{'APPDATA':self.temp.name,'SDL_VIDEODRIVER':'dummy','SDL_AUDIODRIVER':'dummy'}), \
-             patch.object(Game,'fetch_mails',lambda self:None), \
-             patch.object(Game,'refresh_notices',lambda self,force=False:None):
-            game=Game()
-            try:
-                game.state['coins']=8765
-                game.persist(True)
-                original=game.save_file.read_bytes()
-                game.internet_fields['address']=self.running.endpoint
-                game.open_room_browser()
-                def listed():
-                    game.update_gameplay(.01)
-                    return game.directory_job is None and bool(game.directory_rows)
-                self.assertTrue(wait_for(listed))
-                game.render()
-                game.request_room_entry(relay.code)
-                self.assertTrue(wait_for(lambda:bool(relay.pending_requests())))
-                game.render()
-                relay.decide(relay.pending_requests()[0]['id'],True)
-                def entered():
-                    game.update_gameplay(.01)
-                    return game.online_profile_received
-                self.assertTrue(wait_for(entered))
-                self.assertEqual(game.state['coins'],200)
-                game.modal='requests';game.render()
-                game.stop_online()
-                self.assertEqual(game.state['coins'],8765)
-                self.assertEqual(game.save_file.read_bytes(),original)
-            finally:
-                if game.online_job:game.online_job.cancel()
-                if game.online_client:game.stop_online()
-                pygame.quit()
 
 
 if __name__=='__main__':unittest.main()

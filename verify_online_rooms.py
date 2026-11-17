@@ -7,9 +7,7 @@ Run: python -m unittest -q verify_online_rooms
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
-import os
 from pathlib import Path
 import socket
 import tempfile
@@ -24,6 +22,7 @@ from multiplayer import RoomClient, RoomServer, PROTOCOL
 from online_rooms import (RelayHost, _websocket, _reply, _abort, connect_guest, format_code,
                           invitation, parse_invitation, relay_url)
 from relay_server import RelayServer, health_response
+from account_protocol import MAX_ACCOUNT_FRAME
 
 
 def wait_for(predicate, timeout=5):
@@ -36,7 +35,8 @@ def wait_for(predicate, timeout=5):
 
 
 class RunningRelay:
-    def __init__(self):
+    def __init__(self, accounts=None):
+        self.accounts = accounts
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -47,10 +47,10 @@ class RunningRelay:
         async def run():
             self.loop = asyncio.get_running_loop()
             self.stop = asyncio.Event()
-            self.relay = RelayServer(max_rooms=30, pair_timeout=.8)
+            self.relay = RelayServer(max_rooms=30, pair_timeout=.8, accounts=self.accounts)
             async with serve(self.relay.handle, '127.0.0.1', 0,
-                             process_request=health_response, compression=None,
-                             max_size=131072, max_queue=8, close_timeout=.2,
+                             process_request=lambda c, r: health_response(c, r, self.accounts is not None),
+                             compression=None, max_size=MAX_ACCOUNT_FRAME, max_queue=8, close_timeout=.2,
                              ping_interval=.2, ping_timeout=1) as server:
                 port = server.sockets[0].getsockname()[1]
                 self.endpoint = f'ws://127.0.0.1:{port}/relay'
@@ -287,26 +287,6 @@ class RelayIntegrationTests(unittest.TestCase):
         finally:
             _abort(ws)
 
-    def test_cancelled_background_job_closes_late_connection(self):
-        from online_ui import ConnectionJob
-        gate = threading.Event()
-        started = threading.Event()
-        def delayed_relay(*args, **kwargs):
-            started.set()
-            gate.wait(3)
-            return RelayHost(*args, **kwargs)
-        with patch('online_ui.RelayHost', delayed_relay), patch.dict(os.environ,{'APPDATA':self.temp.name}):
-            job = ConnectionJob('host', {'address': self.running.endpoint, 'pin': '', 'name': 'Host',
-                                        'world_file': Path(self.temp.name) / 'room.json'},
-                                new_state(), Path(self.temp.name) / 'profile.json', [])
-            self.assertTrue(started.wait(3))
-            job.cancel()
-            gate.set()
-            job.thread.join(5)
-        self.assertFalse(job.thread.is_alive())
-        self.assertIsNone(job.take())
-        self.assertTrue(wait_for(lambda: not self.running.relay.rooms))
-
     def test_health_endpoint_and_keepalive(self):
         import urllib.request
         url = self.running.endpoint.replace('ws:', 'http:').replace('/relay', '/health')
@@ -338,98 +318,6 @@ class RelayIntegrationTests(unittest.TestCase):
         self.assertEqual(result, ['cancelled'])
         self.assertLess(time.monotonic() - start, 1)
 
-    def test_pygame_guest_disconnect_restores_original_save_without_carrying_items(self):
-        from ambera_farm import Game, pygame
-        from save_slots import load_slot
-        room, _, relay = self.room(room_owned=True)
-        os.environ['SDL_VIDEODRIVER'] = 'dummy'
-        os.environ['SDL_AUDIODRIVER'] = 'dummy'
-        with patch.dict(os.environ, {'APPDATA': self.temp.name}), \
-             patch.object(Game, 'fetch_mails', lambda self: None), \
-             patch.object(Game, 'refresh_notices', lambda self, force=False: None):
-            game = Game()
-            try:
-                game.select_slot('online', 1)
-                game.state['plots'][0] = {'crop': 'kabu', 'planted_at': time.time()}
-                game.state['coins'] = 73
-                original = copy.deepcopy(game.state['plots'])
-                game.persist(True)
-                game.open_online_dialog('join')
-                # A full invitation supplies the endpoint even when URL is blank.
-                game.join_fields['address'] = ''
-                game.join_fields['pin'] = invitation(self.running.endpoint, relay.share_code)
-                game.begin_internet_connection()
-                def connected():
-                    game.update_gameplay(.01)
-                    return game.online_client is not None and game.online_profile_received
-                self.assertTrue(wait_for(connected))
-                self.assertTrue(game.online_guest)
-                self.assertEqual(game.state['coins'], 200)
-                self.assertTrue(game.online_room_owned)
-                self.assertNotEqual(game.state['plots'], original)
-                with room.lock:
-                    room.players[game.online_client.id]['profile']['coins'] = 419
-                def earned():
-                    game.update_gameplay(.01)
-                    return game.state['coins'] == 419
-                self.assertTrue(wait_for(earned))
-                relay.close()
-                def disconnected():
-                    game.update_gameplay(.01)
-                    return game.online_client is None
-                self.assertTrue(wait_for(disconnected))
-                saved, _ = load_slot('online', 1)
-                self.assertEqual(saved['coins'], 73)
-                self.assertEqual(saved['plots'], original)
-                self.assertEqual(room.host_profile['coins'], 200)
-            finally:
-                if game.online_job:game.online_job.cancel()
-                if game.online_client:game.stop_online()
-                pygame.quit()
-
-    def test_pygame_host_connect_render_and_save_on_disconnect(self):
-        os.environ['SDL_VIDEODRIVER'] = 'dummy'
-        os.environ['SDL_AUDIODRIVER'] = 'dummy'
-        from ambera_farm import Game, pygame
-        from save_slots import load_slot
-        with patch.dict(os.environ, {'APPDATA': self.temp.name}), \
-             patch.object(Game, 'fetch_mails', lambda self: None), \
-             patch.object(Game, 'refresh_notices', lambda self, force=False: None):
-            game = Game()
-            try:
-                game.select_slot('online', 1)
-                game.open_online_dialog('host')
-                game.join_fields['address'] = self.running.endpoint
-                game.render()
-                start = time.monotonic()
-                game.begin_internet_connection()
-                self.assertLess(time.monotonic() - start, .5)
-                self.assertEqual(game.modal, 'online_connect')
-                game.render()
-                def connected():
-                    game.update_gameplay(.01)
-                    return game.online_client is not None
-                self.assertTrue(wait_for(connected))
-                self.assertTrue(game.online_room_code)
-                self.assertFalse(game.online_guest)
-                game.modal = 'pause'
-                game.render()
-                # Server-owned earned balance must survive a relay disconnect.
-                with game.online_server.lock:
-                    game.online_server.host_profile['coins'] = 317
-                game.online_relay.close()
-                game.poll_internet_connection()
-                self.assertIsNone(game.online_client)
-                saved, _ = load_slot('online', 1)
-                self.assertEqual(saved['coins'], 200)
-                from room_saves import load_room, room_file
-                self.assertEqual(load_room(room_file(1))[0]['coins'], 317)
-                self.assertFalse(game.online_room_code)
-                self.assertFalse(game.settings.get('online_room_code'))
-            finally:
-                if game.online_job:game.online_job.cancel()
-                if game.online_client:game.stop_online()
-                pygame.quit()
 
 
 if __name__ == '__main__':

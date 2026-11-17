@@ -13,6 +13,18 @@ from exe_launcher import parse_version
 BASE=Path(__file__).resolve().parent
 
 
+def pack_setup(setup):
+    setup=Path(setup)
+    dest=setup.with_suffix('.zip')
+    with zipfile.ZipFile(dest,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=3) as archive:
+        archive.write(setup,setup.name)
+    with zipfile.ZipFile(dest) as archive:
+        if archive.namelist() != [setup.name] or archive.testzip() is not None:
+            raise RuntimeError('Setup ZIP did not pass validation')
+    print('CREATED',dest,dest.stat().st_size,'bytes',flush=True)
+    return dest
+
+
 def find_compiler():
     executable=shutil.which('ISCC.exe')
     if executable:return Path(executable)
@@ -45,6 +57,7 @@ def build(release_folder=None, compiler=None):
     setup=output/f'AmberaFarm_Setup_v{version}.exe'
     if not setup.is_file():raise FileNotFoundError(setup)
     print('CREATED',setup,setup.stat().st_size,'bytes',flush=True)
+    pack_setup(setup)
     return setup
 
 

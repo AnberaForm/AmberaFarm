@@ -6,3 +6,4 @@ __pycache__/
 .ambera_venv/
 launcher_log.txt
 release/
+.account_preview/
